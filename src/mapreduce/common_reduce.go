@@ -66,7 +66,10 @@ func doReduce(
 		dec := json.NewDecoder(imm)
 		err = dec.Decode(&kv)
 		for err == nil {
-			keys = append(keys, kv.Key)
+			// is this key seen?
+			if _, ok := kvs[kv.Key]; !ok {
+				keys = append(keys, kv.Key)
+			}
 			kvs[kv.Key] = append(kvs[kv.Key], kv.Value)
 
 			// decode repeatedly until an error
