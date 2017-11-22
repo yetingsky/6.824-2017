@@ -1,14 +1,21 @@
 package mapreduce
 
+import (
+	"os"
+	"log"
+	"encoding/json"
+	"sort"
+)
+
 // doReduce manages one reduce task: it reads the intermediate
 // key/value pairs (produced by the map phase) for this task, sorts the
 // intermediate key/value pairs by key, calls the user-defined reduce function
 // (reduceF) for each key, and writes the output to disk.
 func doReduce(
-	jobName string, // the name of the whole MapReduce job
+	jobName string,       // the name of the whole MapReduce job
 	reduceTaskNumber int, // which reduce task this is
-	outFile string, // write the output here
-	nMap int, // the number of map tasks that were run ("M" in the paper)
+	outFile string,       // write the output here
+	nMap int,             // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
 ) {
 	//
@@ -43,4 +50,43 @@ func doReduce(
 	// }
 	// file.Close()
 	//
+	var keys []string                   // store all keys in this partition
+	var kvs = make(map[string][]string) // store all key-value pairs from nMap imm files
+
+	// read nMap imm files from map workers
+	for i := 0; i < nMap; i++ {
+		fn := reduceName(jobName, i, reduceTaskNumber)
+		imm, err := os.Open(fn)
+		if err != nil {
+			log.Printf("open immediate file %s failed", fn)
+			continue
+		}
+
+		var kv KeyValue
+		dec := json.NewDecoder(imm)
+		err = dec.Decode(&kv)
+		for err == nil {
+			keys = append(keys, kv.Key)
+			kvs[kv.Key] = append(kvs[kv.Key], kv.Value)
+
+			// decode repeatedly until an error
+			err = dec.Decode(&kv)
+		}
+	}
+
+	// Original MapReduce Paper 4.2 Ordering Guarantees
+	// Keys in one partition are processed in increasing key order
+	sort.Strings(keys)
+	out, err := os.Create(outFile)
+	if err != nil {
+		log.Printf("create output file %s failed", outFile)
+		return
+	}
+	enc := json.NewEncoder(out)
+	for _, key := range keys {
+		if err = enc.Encode(KeyValue{key, reduceF(key, kvs[key])}); err != nil {
+			log.Printf("write [key: %s] to file %s failed", key, outFile)
+		}
+	}
+	out.Close()
 }
