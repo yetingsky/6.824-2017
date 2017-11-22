@@ -33,7 +33,6 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// them have been completed successfully should the function return.
 	// Remember that workers may fail, and that any given worker may finish
 	// multiple tasks.
-	fmt.Printf("Schedule: %v phase done\n", phase)
 
 	// schedule will wait until all worker has done their jobs
 	var wg sync.WaitGroup
@@ -44,25 +43,45 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	task.NumOtherPhase = n_other
 	task.Phase = phase
 
-	for i := 0; i < ntasks; i++ {
-		wg.Add(1)
+	// task id will get from this channel
+	var taskChan = make(chan int)
+	go func() {
+		for i := 0; i < ntasks; i++ {
+			wg.Add(1)
+			taskChan <- i
+		}
+		// wait all workers have done their job, then close taskChan
+		wg.Wait()
+		close(taskChan)
+	}()
 
+	// assign all task to worker
+	for i := range taskChan {
 		// get a worker from register channel
 		worker := <-registerChan
+
 		task.TaskNumber = i
 		if phase == mapPhase {
 			task.File = mapFiles[i]
 		}
+
 		// Note: must use parameter
 		go func(worker string, task DoTaskArgs) {
-			defer wg.Done()
-			// TODO: handle worker failure
-			if !call(worker, "Worker.DoTask", &task, nil) {
-				log.Printf("Schedule: assign %s task %v to %s failed", phase, task.TaskNumber, worker)
+			if call(worker, "Worker.DoTask", &task, nil) {
+				// only successful call will call wg.Done()
+				wg.Done()
+
+				// put worker back to register channel, in another goroutines
+				// to avoid deadlock
+				go func() { registerChan <- worker }()
+			} else {
+				log.Printf("Schedule: assign %s task %v to %s failed", phase,
+					task.TaskNumber, worker)
+
+				// put failed task back to task channel
+				taskChan <- task.TaskNumber
 			}
-			// put worker back to register channel, in another goroutines to avoid deadlock
-			go func() { registerChan <- worker }()
 		}(worker, task)
 	}
-	wg.Wait()
+	fmt.Printf("Schedule: %v phase done\n", phase)
 }
