@@ -1,8 +1,8 @@
 package main
 
-import "os"
-import "fmt"
 import (
+	"os"
+	"fmt"
 	"mapreduce"
 	"strings"
 	"unicode"
