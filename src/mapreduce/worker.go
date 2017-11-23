@@ -67,6 +67,7 @@ func (wk *Worker) Shutdown(_ *struct{}, res *ShutdownReply) error {
 	defer wk.Unlock()
 	res.Ntasks = wk.nTasks
 	wk.nRPC = 1
+	wk.l.Close()
 	return nil
 }
 
@@ -108,6 +109,7 @@ func RunWorker(MasterAddress string, me string,
 		wk.Lock()
 		if wk.nRPC == 0 {
 			wk.Unlock()
+			wk.l.Close()
 			break
 		}
 		wk.Unlock()
@@ -121,6 +123,5 @@ func RunWorker(MasterAddress string, me string,
 			break
 		}
 	}
-	wk.l.Close()
 	debug("RunWorker %s exit\n", me)
 }
