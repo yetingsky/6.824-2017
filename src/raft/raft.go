@@ -150,7 +150,6 @@ func (rf *Raft) fillRequestVoteArgs(args *RequestVoteArgs) {
 
 	args.Term = rf.currentTerm
 	args.CandidateID = rf.me
-
 	args.LastLogIndex = len(rf.logs) - 1
 	args.LastLogTerm = rf.logs[args.LastLogIndex].Term
 }
@@ -246,7 +245,7 @@ type AppendEntriesArgs struct {
 	LeaderCommit int        // leader's commitIndex
 }
 
-func (rf *Raft) fillAppendEntriesArgs(args *AppendEntriesArgs, hearbeat bool) {
+func (rf *Raft) fillAppendEntriesArgs(args *AppendEntriesArgs, heartbeat bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -254,10 +253,10 @@ func (rf *Raft) fillAppendEntriesArgs(args *AppendEntriesArgs, hearbeat bool) {
 	args.LeaderID = rf.me
 	args.PrevLogIndex = len(rf.logs) - 1
 	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-	if hearbeat {
+	args.LeaderCommit = rf.commitIndex
+	if heartbeat {
 		args.Entries = nil
 	}
-	args.LeaderCommit = rf.commitIndex
 }
 
 type AppendEntriesReply struct {
@@ -270,15 +269,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	// if heartbeat message, suppress leader-election
-	if args.Entries == nil {
+	if len(args.Entries) == 0 {
 		if args.Term >= rf.currentTerm {
 			reply.Success = true
 
-			// find new leader, changed to follower
+			// encounter a new leader, changed to follower
 			if rf.isLeader {
 				rf.isLeader = false
 			}
-			// reset election
+			// reset election timer
 			rf.resetTimer <- struct{}{}
 		} else {
 			reply.CurrentTerm = rf.currentTerm
@@ -324,96 +323,110 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-func (rf *Raft) heartBeats() {
+// process replay of appendEntries including heartbeat
+func (rf *Raft) heartbeat(n int) {
+	var args AppendEntriesArgs
+	rf.fillAppendEntriesArgs(&args, true)
+
+	var reply AppendEntriesReply
+	if rf.sendAppendEntries(n, &args, &reply) {
+		if !reply.Success {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// found a new leader, turn to follower
+			if reply.CurrentTerm > rf.currentTerm {
+				rf.currentTerm = reply.CurrentTerm
+				rf.isLeader = false
+				rf.votedFor = -1
+			} else {
+				// TODO: send log entry from leader
+			}
+		}
+	}
+}
+
+// heartbeatDaemon will exit when peer is not leader any more
+// Only leader can issue heartbeat message.
+func (rf *Raft) heartbeatDaemon() {
 	for {
 		if _, isLeader := rf.GetState(); isLeader {
-			// prepare heartbeat parameters
-			var args AppendEntriesArgs
-			rf.fillAppendEntriesArgs(&args, true)
-
-			me := rf.me
-			peers := len(rf.peers)
-
-			for i := 0; i < peers; i++ {
-				if i != me {
-					go func(n int) {
-						var reply AppendEntriesReply
-						rf.sendAppendEntries(n, &args, &reply)
-
-						// there is a new leader or network partition
-						if !reply.Success {
-							rf.mu.Lock()
-							if reply.CurrentTerm > rf.currentTerm {
-								rf.currentTerm = reply.CurrentTerm
-								rf.isLeader = false
-								rf.votedFor = -1
-							}
-							rf.mu.Unlock()
-						}
-					}(i)
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					// reset  itself's electionTimer
+					rf.resetTimer <- struct{}{}
+				} else {
+					go rf.heartbeat(i)
 				}
 			}
-			// reset itself
-			rf.resetTimer <- struct{}{}
 			time.Sleep(rf.heartbeatInterval)
 		} else {
+			break
+		}
+	}
+}
+
+// canvassVotes issues RequestVote RPC
+func (rf *Raft) canvassVotes() {
+	var voteArgs RequestVoteArgs
+	rf.fillRequestVoteArgs(&voteArgs)
+	peers := len(rf.peers)
+
+	// buffered channel, avoid goroutine leak
+	replies := make(chan RequestVoteReply, peers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < peers; i++ {
+		if i == rf.me {
+			// reset itself's electionTimer
+			rf.resetTimer <- struct{}{}
+		} else {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				var reply RequestVoteReply
+				if rf.sendRequestVote(n, &voteArgs, &reply) {
+					replies <- reply
+				}
+			}(i)
+		}
+	}
+	// closer, in case
+	go func() {
+		wg.Wait()
+		close(replies)
+	}()
+
+	var votes = 1
+	for reply := range replies {
+		if reply.VoteGranted == true {
+			if votes++; votes > peers/2 {
+				rf.mu.Lock()
+				rf.isLeader = true
+				rf.mu.Unlock()
+
+				// new leader, start heartbeat daemon
+				go rf.heartbeatDaemon()
+				return
+			}
+		} else if reply.CurrentTerm > voteArgs.Term {
+			rf.mu.Lock()
+			rf.isLeader = false
+			rf.votedFor = -1 // return to follower
+			rf.mu.Unlock()
 			return
 		}
 	}
 }
 
-func (rf *Raft) canvassVotes() {
-	var voteArgs RequestVoteArgs
-	rf.fillRequestVoteArgs(&voteArgs)
-
-	peers := len(rf.peers)
-	replies := make([]RequestVoteReply, peers)
-	var wg sync.WaitGroup
-	for i := 0; i < peers; i++ {
-		if i != rf.me {
-			wg.Add(1)
-			go func(n int) {
-				rf.sendRequestVote(n, &voteArgs, &replies[n])
-				wg.Done()
-			}(i)
-		}
-	}
-	rf.resetTimer <- struct{}{}
-	wg.Wait()
-
-	// itself one vote
-	var votes = 1
-	for i := 0; i < peers; i++ {
-		if i != rf.me {
-			if replies[i].CurrentTerm > voteArgs.Term {
-				rf.mu.Lock()
-				rf.isLeader = false
-				rf.votedFor = -1 // return to follower
-				rf.mu.Unlock()
-				return
-			}
-			if replies[i].VoteGranted == true {
-				votes++
-			}
-		}
-	}
-	// become leader
-	if votes > peers/2 {
-		rf.mu.Lock()
-		rf.isLeader = true
-		rf.mu.Unlock()
-
-		// send Heartbeat
-		go rf.heartBeats()
-	}
-}
-
+// electionDaemon never exit, but can be reset
 func (rf *Raft) electionDaemon() {
 	for {
 		select {
 		case <-rf.resetTimer:
 			rf.electionTimer.Reset(rf.electionTimeout)
 		case <-rf.electionTimer.C:
+			rf.electionTimer.Reset(rf.electionTimeout)
 			go rf.canvassVotes()
 		}
 	}
@@ -452,13 +465,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = len(rf.logs)
 	}
 
-	// electionTimeout: 300~500 ms
-	rf.electionTimeout = time.Millisecond * (300 + time.Duration(rand.Int63()%200))
+	// electionTimeout: 400~800 ms
+	rf.electionTimeout = time.Millisecond * (400 + time.Duration(rand.Int63()%400))
 	rf.electionTimer = time.NewTimer(rf.electionTimeout)
 	rf.resetTimer = make(chan struct{})
 
-	// heartbeat: 150ms
-	rf.heartbeatInterval = time.Millisecond * 150
+	// heartbeat: 100ms
+	rf.heartbeatInterval = time.Millisecond * 100
 
 	DPrintf("peer %d : election(%s) heartbeat(%s)\n", rf.me, rf.electionTimeout, rf.heartbeatInterval)
 
