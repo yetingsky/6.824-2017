@@ -313,11 +313,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.isLeader = false
 		rf.currentTerm = args.Term
 
-		// give leader a change
+		// give new leader a change
 		rf.resetTimer <- struct{}{}
 	} else {
-		// since we are leader, reject AE
+		// if leader or if not my leader, reject AE
 		if rf.isLeader {
+			reply.Success = false
+			return
+		} else if rf.votedFor != args.LeaderID {
 			reply.Success = false
 			return
 		}
@@ -327,6 +330,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(rf.logs) > args.PrevLogIndex {
 		preLogIdx = args.PrevLogIndex
 		preLogTerm = rf.logs[preLogIdx].Term
+	}
+
+	// for stale leader or crashed follower
+	if rf.votedFor == -1 || rf.votedFor == rf.me {
+		rf.votedFor = args.LeaderID
 	}
 
 	// last log is match
@@ -359,8 +367,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			go func() { rf.commitCond.Broadcast() }()
 		}
 		if len(args.Entries) > 0 {
-			DPrintf("[%d-%s]: AE success from leader %d (%d cmd @ %d), commit index: l->%d, f->%d.\n",
-				rf.me, rf, args.LeaderID, len(args.Entries), preLogIdx+1, args.LeaderCommit, rf.commitIndex)
+			DPrintf("[%d-%s]: AE success from leader %d (%d cmd: %v @ %d), commit index: l->%d, f->%d.\n",
+				rf.me, rf, args.LeaderID, len(args.Entries), args.Entries, preLogIdx+1, args.LeaderCommit, rf.commitIndex)
 		} else {
 			//DPrintf("[%d-%s]: Heartbeat success from leader %d, commit index: l->%d, f->%d.\n",
 			//	rf.me, rf, args.LeaderID, args.LeaderCommit, rf.commitIndex)
@@ -371,9 +379,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// extra info for restore missing entries quickly: from original paper
 		// "the term of the conflicting entry"
 		// "and the first index it stores from that term"
+		var term = preLogTerm
+		if args.PrevLogTerm < term {
+			term = args.PrevLogTerm
+		}
 		i := 1
 		for ; i < len(rf.logs); i++ {
-			if rf.logs[i].Term == preLogTerm {
+			if rf.logs[i].Term == term {
 				break
 			}
 		}
