@@ -70,15 +70,15 @@ type Raft struct {
 	electionTimeout   time.Duration // 400~800ms
 	heartbeatInterval time.Duration // 100ms
 
-	currentTerm   int                 // Persisted before responding to RPCs
-	votedFor      int                 // Persisted before responding to RPCs
-	logs          []LogEntry          // Persisted before responding to RPCs
-	commitIndexCh chan struct{}       // for commitIndex update
-	commitIndex   int                 // Volatile state on all servers
-	lastApplied   int                 // Volatile state on all servers
-	nextIndex     []int               // Leader only, reinitialized after election
-	matchIndex    []int               // Leader only, reinitialized after election
-	appendStatus  map[int]*appendCond // AppendEntry status for each new log
+	currentTerm  int                 // Persisted before responding to RPCs
+	votedFor     int                 // Persisted before responding to RPCs
+	logs         []LogEntry          // Persisted before responding to RPCs
+	commitCond   *sync.Cond          // for commitIndex update
+	commitIndex  int                 // Volatile state on all servers
+	lastApplied  int                 // Volatile state on all servers
+	nextIndex    []int               // Leader only, reinitialized after election
+	matchIndex   []int               // Leader only, reinitialized after election
+	appendStatus map[int]*appendCond // AppendEntry status for each new log
 
 	applyCh chan ApplyMsg // outgoing channel to service
 }
@@ -356,11 +356,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.commitIndex = args.LeaderCommit
 			}
 			// signal possible update commit index
-			go func() { rf.commitIndexCh <- struct{}{} }()
+			go func() { rf.commitCond.Broadcast() }()
 		}
 		if len(args.Entries) > 0 {
-			DPrintf("[%d-%s]: AE success from leader %d (%d cmd), commit index: l->%d, f->%d.\n",
-				rf.me, rf, args.LeaderID, len(args.Entries), args.LeaderCommit, rf.commitIndex)
+			DPrintf("[%d-%s]: AE success from leader %d (%d cmd @ %d), commit index: l->%d, f->%d.\n",
+				rf.me, rf, args.LeaderID, len(args.Entries), preLogIdx+1, args.LeaderCommit, rf.commitIndex)
 		} else {
 			//DPrintf("[%d-%s]: Heartbeat success from leader %d, commit index: l->%d, f->%d.\n",
 			//	rf.me, rf, args.LeaderID, args.LeaderCommit, rf.commitIndex)
@@ -425,6 +425,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if isLeader {
 		rf.mu.Lock()
+		// double check
+		if !rf.isLeader {
+			defer rf.mu.Lock()
+			return -1, 0, false
+		}
 		log := LogEntry{rf.currentTerm, command}
 		rf.logs = append(rf.logs, log)
 		index = len(rf.logs) - 1
@@ -466,7 +471,7 @@ func (rf *Raft) startLogAgree(index int) {
 
 				// a way to cancel unnecessary appendEntry
 				if exit {
-					DPrintf("[%d-%s]: shutdown AE to follower %d @ log entry %d\n", rf.me, rf, n, index)
+					//DPrintf("[%d-%s]: shutdown AE to follower %d @ log entry %d\n", rf.me, rf, n, index)
 					return
 				}
 				DPrintf("[%d-%s]: start AE to follower %d @ log entry %d\n", rf.me, rf, n, index)
@@ -495,9 +500,7 @@ func (rf *Raft) updateCommitIndex() {
 						DPrintf("[%d-%s]: update commit index %d -> %d\n", rf.me, rf, rf.commitIndex, N)
 						rf.commitIndex = N
 
-						// signal
-						go func() { rf.commitIndexCh <- struct{}{} }()
-						break
+						go func() { rf.commitCond.Broadcast() }()
 					}
 				}
 			}
@@ -517,8 +520,10 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) cancelAppendEntries(n int) {
+	rf.appendStatus[n].mu.Lock()
 	rf.appendStatus[n].exit = true
 	rf.appendStatus[n].cond.Broadcast()
+	rf.appendStatus[n].mu.Unlock()
 }
 
 // heartbeat with consistency checking
@@ -542,16 +547,20 @@ func (rf *Raft) singlePass(n, index int, heartbeat bool) {
 				count := len(rf.peers)
 				length := len(rf.logs)
 				for i := 0; i < count; i++ {
+					rf.appendStatus[i].mu.Lock()
 					rf.appendStatus[i].index = length
 					rf.appendStatus[i].exit = false
+					rf.appendStatus[i].mu.Unlock()
 				}
 			}
 			// update
 			rf.matchIndex[n] = rf.nextIndex[n] - 1
 
 			if !heartbeat {
+				rf.appendStatus[n].mu.Lock()
 				rf.appendStatus[n].index++
 				rf.appendStatus[n].cond.Broadcast()
+				rf.appendStatus[n].mu.Unlock()
 			}
 		} else {
 			// found a new leader, turn to follower
@@ -597,21 +606,19 @@ func (rf *Raft) singlePass(n, index int, heartbeat bool) {
 // applyLogEntryDaemon exit when leader fail
 func (rf *Raft) applyLogEntryDaemon() {
 	for {
-		// wait for notify
-		<-rf.commitIndexCh
+		// wait
+		rf.mu.Lock()
+		rf.commitCond.Wait()
 
-		var index = -1
 		for rf.lastApplied < rf.commitIndex {
-			rf.mu.Lock()
 			rf.lastApplied++
-			index = rf.lastApplied
+			index := rf.lastApplied
 
 			// current command is replicated
 			reply := ApplyMsg{
 				Index:   index,
 				Command: rf.logs[index].Command,
 			}
-			rf.mu.Unlock()
 
 			DPrintf("[%d-%s]: applyLogEntry, index: %d, cmd: %v\n", rf.me, rf, reply.Index, reply.Command)
 
@@ -619,6 +626,7 @@ func (rf *Raft) applyLogEntryDaemon() {
 			// Note: must in the same goroutine, or may result in out of order apply
 			rf.applyCh <- reply
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -718,8 +726,10 @@ func (rf *Raft) resetOnElection() {
 		rf.matchIndex[i] = 0
 		rf.nextIndex[i] = length
 
+		rf.appendStatus[i].mu.Lock()
 		rf.appendStatus[i].index = length
 		rf.appendStatus[i].exit = false
+		rf.appendStatus[i].mu.Unlock()
 	}
 }
 
@@ -732,8 +742,10 @@ func (rf *Raft) electionDaemon() {
 		case <-rf.electionTimer.C:
 			rf.electionTimer.Reset(rf.electionTimeout)
 
+			rf.mu.Lock()
 			DPrintf("[%d-%s]: peer %d election timeout, issue election @ term %d\n",
 				rf.me, rf, rf.me, rf.currentTerm)
+			rf.mu.Unlock()
 			go rf.canvassVotes()
 		}
 	}
@@ -791,7 +803,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetTimer = make(chan struct{})
 
 	// commitCh
-	rf.commitIndexCh = make(chan struct{})
+	rf.commitCond = sync.NewCond(&rf.mu)
 
 	// heartbeat: 120ms
 	rf.heartbeatInterval = time.Millisecond * 120
