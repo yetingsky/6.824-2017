@@ -266,13 +266,7 @@ func (rf *Raft) fillAppendEntriesArgs(n, index int, heartbeat bool) *AppendEntri
 
 		if rf.nextIndex[n] == rf.matchIndex[n]+1 {
 			args.Entries = nil
-			//DPrintf("[%d-%s]: <heartbeat> fillAppendEntriesArgs (n: %d, preLogIdx: %d, len(rf.logs): %d)\n",
-			//	rf.me,rf, n, args.PrevLogIndex, len(rf.logs))
-
 		} else {
-			//DPrintf("[%d-%s]: <consistency> fillAppendEntriesArgs (n: %d, preLogIdx: %d, len(rf.logs): %d)\n",
-			//	rf.me,rf, n, args.PrevLogIndex, len(rf.logs))
-
 			// try to restore missing log entry
 			if rf.nextIndex[n] < len(rf.logs) {
 				args.Entries = append(args.Entries, rf.logs[rf.nextIndex[n]:]...)
@@ -321,6 +315,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// give leader a change
 		rf.resetTimer <- struct{}{}
+	} else {
+		// since we are leader, reject AE
+		if rf.isLeader {
+			reply.Success = false
+			return
+		}
 	}
 
 	preLogIdx, preLogTerm := 0, 0
@@ -384,7 +384,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				reply.FirstIndex)
 		}
 
-		if len(rf.logs) > args.PrevLogIndex {
+		if len(rf.logs) <= args.PrevLogIndex {
 			DPrintf("[%d-%s]: AE failed from leader %d, leader has more logs (%d > %d).\n",
 				rf.me, rf, args.LeaderID, args.PrevLogIndex, len(rf.logs)-1)
 		} else {
@@ -585,7 +585,7 @@ func (rf *Raft) singlePass(n, index int, heartbeat bool) {
 				if reply.FirstIndex == 0 {
 					rf.nextIndex[n]--
 				} else {
-					rf.nextIndex[n] = reply.FirstIndex
+					rf.nextIndex[n] = reply.FirstIndex + 1
 				}
 
 				// rf.nextIndex[n] may be 0, because of unstable net, when reach 0, reset to 1
