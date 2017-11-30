@@ -78,7 +78,7 @@ type Raft struct {
 	matchIndex   []int        // Leader only, reinitialized after election
 
 	applyCh  chan ApplyMsg // outgoing channel to service
-	shutdown chan struct{}
+	shutdown chan struct{} // shutdown channel, shut raft instance gracefully
 }
 
 // return currentTerm and whether this server
@@ -737,9 +737,16 @@ func (rf *Raft) Kill() {
 	time.Sleep(2 * time.Second)
 }
 
-// applyLogEntryDaemon exit when leader fail
+// applyLogEntryDaemon exit when shutdown channel is closed
 func (rf *Raft) applyLogEntryDaemon() {
 	for {
+		select {
+		case <-rf.shutdown:
+			DPrintf("[%d-%s]: peer %d shutdown apply log entry to client daemon.\n", rf.me, rf, rf.me)
+			return
+		default:
+		}
+
 		var logs []LogEntry
 		// wait
 		rf.mu.Lock()
