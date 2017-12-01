@@ -261,9 +261,9 @@ type AppendEntriesReply struct {
 	CurrentTerm int  // currentTerm, for leader to update itself
 	Success     bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 
-	// extra for heartbeat from follower
-	//ConflictTerm int // term of the conflicting entry
-	FirstIndex int // the first index it stores for ConflictTerm
+	// extra info for heartbeat from follower
+	ConflictTerm int // term of the conflicting entry
+	FirstIndex   int // the first index it stores for ConflictTerm
 }
 
 // AppendEntries handler, including heartbeat, must backup quickly
@@ -378,25 +378,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Success = false
 
-		// extra info for restore missing entries quickly: from original paper
-		// "the term of the conflicting entry and the first index it stores from that term"
-		var term = preLogTerm
-		if args.PrevLogTerm < term {
-			term = args.PrevLogTerm
-		}
-		i := 1
-		for ; i < len(rf.logs); i++ {
-			if rf.logs[i].Term >= term {
-				break
-			}
-		}
-		if i != len(rf.logs) {
-			//reply.ConflictTerm = preLogTerm
-			reply.FirstIndex = i
-		} else {
-			//reply.ConflictTerm = preLogTerm
-			reply.FirstIndex = 1
-		}
+		// extra info for restore missing entries quickly: from original paper and lecture note
+		// if follower rejects, includes this in reply:
+		//
+		// the follower's term in the conflicting entry
+		// the index of follower's first entry with that term
+		//
+		// if leader knows about the conflicting term:
+		// 		move nextIndex[i] back to leader's last entry for the conflicting term
+		// else:
+		// 		move nextIndex[i] back to follower's first index
+		reply.ConflictTerm = preLogTerm
+		reply.FirstIndex = preLogIdx
+
 		DPrintf("[%d-%s]: leader %d should start @ log entry %d\n", rf.me, rf, args.LeaderID,
 			reply.FirstIndex)
 
@@ -554,8 +548,18 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 					}
 
 					// with extra info, leader can be more clever
-					if reply.FirstIndex <= 0 {
-						rf.nextIndex[n]--
+					// Does leader know conflicting term?
+					var know, lastIndex = false, 0
+					for i := len(rf.logs) - 1; i > 0; i-- {
+						if rf.logs[i].Term == reply.ConflictTerm {
+							know = true
+							lastIndex = i
+							break
+						}
+					}
+
+					if know {
+						rf.nextIndex[n] = lastIndex
 					} else {
 						rf.nextIndex[n] = reply.FirstIndex
 					}
@@ -665,8 +669,8 @@ func (rf *Raft) updateCommitIndex() {
 //
 func (rf *Raft) Kill() {
 	close(rf.shutdown)
-	// wait for 2s to shutdown gracefully
-	time.Sleep(2 * time.Second)
+	// wait for 2 heartbeat interval to shutdown gracefully
+	time.Sleep(2 * rf.heartbeatInterval)
 }
 
 // applyLogEntryDaemon exit when shutdown channel is closed
