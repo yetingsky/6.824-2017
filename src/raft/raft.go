@@ -185,7 +185,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 
 	// Your code here (2A, 2B).
 	if args.Term < rf.CurrentTerm {
@@ -222,6 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 		}
 	}
+	rf.persist()
 }
 
 //
@@ -289,7 +289,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("[%d-%s]: rpc AE, from peer: %d, term: %d\n", rf.me, rf, args.LeaderID, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 
 	if args.Term < rf.CurrentTerm {
 		//DPrintf("[%d-%s]: AE failed from leader %d. (heartbeat: leader's term < follower's term (%d < %d))\n",
@@ -411,6 +410,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.me, rf, args.LeaderID, args.PrevLogIndex, preLogIdx, args.PrevLogTerm, preLogTerm)
 		}
 	}
+	rf.persist()
 }
 
 // bool is not useful
@@ -435,16 +435,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index, term, isLeader := -1, 0, false
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	defer rf.persist()
-
 	select {
 	case <-rf.shutdown:
-		DPrintf("[%d-%s]: leader %d is shutting down, reject client request.\n", rf.me, rf, rf.me)
 		return index, term, isLeader
 	default:
 	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	// Your code here (2B).
 	if rf.isLeader {
@@ -464,6 +462,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		// has work to do
 		rf.wakeupConsistencyCheck()
+		rf.persist()
 	}
 	return index, term, isLeader
 }
@@ -514,7 +513,7 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 
 			// Wait until timeout? Need a way to give up (timeout)
 			timeout := time.NewTimer(rf.heartbeatInterval / 2)
-			replyCh := make(chan struct{})
+			replyCh := make(chan struct{}, 1)
 			go func() {
 				rf.sendAppendEntries(n, &args, &reply)
 				replyCh <- struct{}{}
@@ -524,7 +523,6 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 			case <-timeout.C:
 				// DPrintf("[%d-%s]: AE failed, no reply from remote server\n", rf.me, rf)
 				// avoid goroutines leak
-				go func() { <-replyCh }()
 			case <-replyCh:
 				if !timeout.Stop() {
 					//DPrintf("[%d-%s]: timeout stop failed.", rf.me, rf)
@@ -557,6 +555,7 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 							rf.wakeupConsistencyCheck()
 						}
 						rf.isLeader = false
+						rf.persist()
 						rf.mu.Unlock()
 
 						rf.resetTimer <- struct{}{}
@@ -671,25 +670,26 @@ func (rf *Raft) Kill() {
 	rf.commitCond.Broadcast()
 	rf.wakeupConsistencyCheck()
 
-	// wait 2 heartbeat interval to shutdown gracefully
-	time.Sleep(2 * rf.heartbeatInterval)
+	// wait 1 heartbeat interval to shutdown gracefully
+	time.Sleep(rf.heartbeatInterval)
 }
 
 // applyLogEntryDaemon exit when shutdown channel is closed
 func (rf *Raft) applyLogEntryDaemon() {
 	for {
-		select {
-		case <-rf.shutdown:
-			DPrintf("[%d-%s]: peer %d is shutting down apply log entry to client daemon.\n", rf.me, rf, rf.me)
-			return
-		default:
-		}
-
 		var logs []LogEntry
 		// wait
 		rf.mu.Lock()
 		for rf.lastApplied == rf.commitIndex {
 			rf.commitCond.Wait()
+			// check if need to shut down
+			select {
+			case <-rf.shutdown:
+				DPrintf("[%d-%s]: peer %d is shutting down apply log entry to client daemon.\n", rf.me, rf, rf.me)
+				close(rf.applyCh)
+				return
+			default:
+			}
 		}
 		last, cur := rf.lastApplied, rf.commitIndex
 		if last < cur {
@@ -741,7 +741,7 @@ func (rf *Raft) canvassVotes() {
 				defer wg.Done()
 				var reply RequestVoteReply
 
-				doneCh := make(chan struct{})
+				doneCh := make(chan struct{}, 1)
 
 				// timeout same with heartbeat
 				timeout := time.NewTimer(rf.heartbeatInterval)
@@ -752,7 +752,6 @@ func (rf *Raft) canvassVotes() {
 
 				select {
 				case <-timeout.C:
-					go func() { <-doneCh }()
 				case <-doneCh:
 					if !timeout.Stop() {
 						//DPrintf("[%d-%s]: timeout stop failed.", rf.me, rf)
@@ -790,6 +789,8 @@ func (rf *Raft) canvassVotes() {
 			rf.mu.Lock()
 			rf.isLeader = false
 			rf.VotedFor = -1 // return to follower
+			rf.CurrentTerm = reply.CurrentTerm
+			rf.persist()
 			rf.mu.Unlock()
 
 			// reset timer
