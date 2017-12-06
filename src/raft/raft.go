@@ -75,6 +75,7 @@ type Raft struct {
 	VotedFor     int          // Persisted before responding to RPCs
 	Logs         []LogEntry   // Persisted before responding to RPCs
 	commitCond   *sync.Cond   // for commitIndex update
+	heartbeatCnt map[int]bool // record heartbeat situation
 	newEntryCond []*sync.Cond // for new log entry
 	commitIndex  int          // Volatile state on all servers
 	lastApplied  int          // Volatile state on all servers
@@ -517,9 +518,14 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 					}
 					rf.matchIndex[n] = rf.nextIndex[n] - 1
 
-					// it's leader's responsibility to update commitIndex
-					rf.updateCommitIndex()
+					rf.heartbeatCnt[n] = true
+					// it's leader's responsibility to update commitIndex, and must no hurry
+					if len(args.Entries) == 0 {
+						// when get a heartbeat message from all followers
+						rf.updateCommitIndex()
+					}
 				} else {
+					rf.heartbeatCnt[n] = false
 					// DPrintf("[%d-%s]: AE failed, term -> arg: %d, reply: %d\n", rf.me, rf, args.Term, reply.CurrentTerm)
 					// found a new leader, turn to follower
 					if reply.CurrentTerm > args.Term {
@@ -633,6 +639,22 @@ func (rf *Raft) updateCommitIndex() {
 
 	target := match[len(rf.peers)/2]
 	if rf.commitIndex < target {
+		cnt := 1 // leader itself is always ok
+		for _, v := range rf.heartbeatCnt {
+			if v {
+				cnt++
+			}
+		}
+		// when majority heartbeat success, then try to update commit index, should be conservative
+		if cnt > len(rf.peers)/2 {
+			// clear
+			for i := 0; i < len(rf.peers); i++ {
+				rf.heartbeatCnt[i] = false
+			}
+		} else {
+			return
+		}
+
 		if rf.Logs[target].Term == rf.CurrentTerm {
 			DPrintf("[%d-%s]: leader %d update commit index %d -> %d @ term %d\n",
 				rf.me, rf, rf.me, rf.commitIndex, target, rf.CurrentTerm)
@@ -912,6 +934,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i := 0; i < len(peers); i++ {
 		rf.newEntryCond[i] = sync.NewCond(&rf.mu)
 	}
+
+	rf.heartbeatCnt = make(map[int]bool)
 
 	// heartbeat: 200ms
 	rf.heartbeatInterval = time.Millisecond * 200
