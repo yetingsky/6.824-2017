@@ -181,28 +181,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	default:
 	}
 
-	DPrintf("[%d-%s]: rpc RV, from peer: %d, term: %d\n", rf.me, rf, args.CandidateID, args.Term)
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	DPrintf("[%d-%s]: rpc RV, from peer: %d, arg term: %d, my term: %d\n",
+		rf.me, rf, args.CandidateID, args.Term, rf.CurrentTerm)
 
 	// Your code here (2A, 2B).
 	if args.Term < rf.CurrentTerm {
 		reply.CurrentTerm = rf.CurrentTerm
 		reply.VoteGranted = false
 	} else {
-		var sameTerm = false
 		if args.Term > rf.CurrentTerm {
 			// convert to follower
 			rf.CurrentTerm = args.Term
 			rf.isLeader = false
 			rf.VotedFor = -1
-		} else {
-			sameTerm = true
 		}
 
 		// if is null (follower) or itself is a candidate (or stale leader) with same term
-		if rf.VotedFor == -1 || (rf.VotedFor == rf.me && !sameTerm) { //|| rf.votedFor == args.CandidateID {
+		if rf.VotedFor == -1 { //|| (rf.VotedFor == rf.me && !sameTerm) { //|| rf.votedFor == args.CandidateID {
 			lastLogIdx := len(rf.Logs) - 1
 			lastLogTerm := rf.Logs[lastLogIdx].Term
 
@@ -216,8 +214,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.VotedFor = args.CandidateID
 				reply.VoteGranted = true
 
-				// DPrintf("[%d-%s]: peer %d vote to peer %d (last log idx: %d->%d, term: %d->%d)\n",
-				//	rf.me, rf, rf.me, args.CandidateID, args.LastLogIndex, lastLogIdx, args.LastLogTerm, lastLogTerm)
+				DPrintf("[%d-%s]: peer %d vote to peer %d (last log idx: %d->%d, term: %d->%d)\n",
+					rf.me, rf, rf.me, args.CandidateID, args.LastLogIndex, lastLogIdx, args.LastLogTerm, lastLogTerm)
 			}
 		}
 	}
@@ -298,42 +296,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term > rf.CurrentTerm {
-		if rf.isLeader {
-			rf.isLeader = false
-			rf.commitCond.Broadcast()
-			rf.wakeupConsistencyCheck()
-		}
-		rf.CurrentTerm = args.Term
-
-		// give new leader a change
-		rf.resetTimer <- struct{}{}
+	// for stale leader
+	if rf.isLeader {
+		rf.isLeader = false
+		rf.commitCond.Broadcast()
+		rf.wakeupConsistencyCheck()
 	}
-
-	// compare commit index
-	if rf.commitIndex <= args.LeaderCommit {
-		// encounter a new leader or the old one
-		if rf.isLeader {
-			rf.isLeader = false
-			rf.commitCond.Broadcast()
-			rf.wakeupConsistencyCheck()
-		}
+	// for straggler (follower)
+	if rf.VotedFor != args.LeaderID {
 		rf.VotedFor = args.LeaderID
-	} else {
-		// if leader or if not my leader, reject AE
-		if rf.isLeader {
-			reply.Success = false
-			DPrintf("[%d-%s]: leader %d get heartbeat from stale leader %d\n",
-				rf.me, rf, rf.me, args.LeaderID)
-			return
-		} else if rf.VotedFor != args.LeaderID {
-			reply.Success = false
-			DPrintf("[%d-%s]: peer %d get heartbeat from stale leader %d\n",
-				rf.me, rf, rf.me, args.LeaderID)
-			return
-		}
 	}
-
+	if rf.CurrentTerm < args.Term {
+		rf.CurrentTerm = args.Term
+	}
 	// valid AE, reset election timer
 	rf.resetTimer <- struct{}{}
 
@@ -352,10 +327,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		var last = preLogIdx
 		for i, log := range args.Entries {
 			if preLogIdx+i+1 < len(rf.Logs) {
-				if rf.Logs[preLogIdx+i+1].Term != log.Term {
-					rf.Logs[preLogIdx+i+1] = log
-					last = preLogIdx + i + 1
-				}
+				rf.Logs[preLogIdx+i+1] = log
+				last = preLogIdx + i + 1
 			} else {
 				rf.Logs = append(rf.Logs, log)
 				last = len(rf.Logs) - 1
@@ -391,20 +364,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 		move nextIndex[i] back to leader's last entry for the conflicting term
 		// else:
 		// 		move nextIndex[i] back to follower's first index
-		reply.ConflictTerm = preLogTerm
-
 		var first = 1
-		for i := preLogIdx - 1; i > 0; i-- {
-			if rf.Logs[i].Term != preLogTerm {
-				first = i + 1
-				break
+		reply.ConflictTerm = preLogTerm
+		if reply.ConflictTerm == 0 {
+			if len(rf.Logs) != 1 {
+				first = len(rf.Logs)
+			}
+		} else {
+			for i := preLogIdx - 1; i > 0; i-- {
+				if rf.Logs[i].Term != preLogTerm {
+					first = i + 1
+					break
+				}
 			}
 		}
 		reply.FirstIndex = first
 
 		if len(rf.Logs) <= args.PrevLogIndex {
-			DPrintf("[%d-%s]: AE failed from leader %d, leader has more logs (%d > %d).\n",
-				rf.me, rf, args.LeaderID, args.PrevLogIndex, len(rf.Logs)-1)
+			DPrintf("[%d-%s]: AE failed from leader %d, leader has more logs (%d > %d), reply: %d - %d.\n",
+				rf.me, rf, args.LeaderID, args.PrevLogIndex, len(rf.Logs)-1, reply.ConflictTerm, reply.FirstIndex)
 		} else {
 			DPrintf("[%d-%s]: AE failed from leader %d, pre idx/term mismatch (%d != %d, %d != %d).\n",
 				rf.me, rf, args.LeaderID, args.PrevLogIndex, preLogIdx, args.PrevLogTerm, preLogTerm)
@@ -567,20 +545,25 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 					// with extra info, leader can be more clever
 					// Does leader know conflicting term?
 					var know, lastIndex = false, 0
-					for i := len(rf.Logs) - 1; i > 0; i-- {
-						if rf.Logs[i].Term == reply.ConflictTerm {
-							know = true
-							lastIndex = i
-							DPrintf("[%d-%s]: leader %d have entry %d is the first entry in term %d.",
-								rf.me, rf, rf.me, i, reply.ConflictTerm)
-							break
+					if reply.ConflictTerm != 0 {
+						for i := len(rf.Logs) - 1; i > 0; i-- {
+							if rf.Logs[i].Term == reply.ConflictTerm {
+								know = true
+								lastIndex = i
+								DPrintf("[%d-%s]: leader %d have entry %d is the last entry in term %d.",
+									rf.me, rf, rf.me, i, reply.ConflictTerm)
+								break
+							}
 						}
-					}
-					if know {
-						rf.nextIndex[n] = lastIndex
+						if know {
+							rf.nextIndex[n] = lastIndex
+						} else {
+							rf.nextIndex[n] = reply.FirstIndex
+						}
 					} else {
 						rf.nextIndex[n] = reply.FirstIndex
 					}
+
 					// rf.nextIndex[n] may be 0, because of unstable net, when reach 0, reset to 1
 					if rf.nextIndex[n] <= 0 {
 						rf.nextIndex[n] = 1
@@ -626,7 +609,6 @@ func (rf *Raft) heartbeatDaemon() {
 		select {
 		case <-rf.shutdown:
 			DPrintf("[%d-%s]: peer %d is closing heartbeatDaemon.\n", rf.me, rf, rf.me)
-			rf.wakeupConsistencyCheck()
 			return
 		default:
 		}
@@ -646,12 +628,20 @@ func (rf *Raft) updateCommitIndex() {
 	copy(match, rf.matchIndex)
 	sort.Ints(match)
 
-	DPrintf("[%d-%s]: leader %d try to update commit index: %v.\n", rf.me, rf, rf.me, rf.matchIndex)
-	if rf.commitIndex < match[len(rf.peers)/2] {
-		DPrintf("[%d-%s]: leader %d update commit index %d -> %d\n",
-			rf.me, rf, rf.me, rf.commitIndex, match[len(rf.peers)/2])
-		rf.commitIndex = match[len(rf.peers)/2]
-		go func() { rf.commitCond.Broadcast() }()
+	DPrintf("[%d-%s]: leader %d try to update commit index: %v @ term %d.\n",
+		rf.me, rf, rf.me, rf.matchIndex, rf.CurrentTerm)
+
+	target := match[len(rf.peers)/2]
+	if rf.commitIndex < target {
+		if rf.Logs[target].Term == rf.CurrentTerm {
+			DPrintf("[%d-%s]: leader %d update commit index %d -> %d @ term %d\n",
+				rf.me, rf, rf.me, rf.commitIndex, target, rf.CurrentTerm)
+			rf.commitIndex = target
+			go func() { rf.commitCond.Broadcast() }()
+		} else {
+			DPrintf("[%d-%s]: leader %d update commit failed (log term %d != current Term %d)\n",
+				rf.me, rf, rf.me, rf.Logs[target].Term, rf.CurrentTerm)
+		}
 	}
 }
 
@@ -670,8 +660,8 @@ func (rf *Raft) Kill() {
 	rf.commitCond.Broadcast()
 	rf.wakeupConsistencyCheck()
 
-	// wait 1 heartbeat interval to shutdown gracefully
-	time.Sleep(rf.heartbeatInterval)
+	// wait 2 heartbeat interval to shutdown gracefully
+	time.Sleep(2 * rf.heartbeatInterval)
 }
 
 // applyLogEntryDaemon exit when shutdown channel is closed
