@@ -434,7 +434,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index, term, isLeader := -1, 0, false
-
 	select {
 	case <-rf.shutdown:
 		return index, term, isLeader
@@ -443,7 +442,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	// Your code here (2B).
 	if rf.isLeader {
 		log := LogEntry{rf.CurrentTerm, command}
@@ -485,6 +483,8 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 		rf.newEntryCond[n].Wait()
 		select {
 		case <-rf.shutdown:
+			rf.mu.Unlock()
+			rf.wakeupConsistencyCheck()
 			DPrintf("[%d-%s]: leader %d is closing consistency check daemon for peer %d.\n", rf.me, rf, rf.me, n)
 			return
 		default:
@@ -685,6 +685,7 @@ func (rf *Raft) applyLogEntryDaemon() {
 			// check if need to shut down
 			select {
 			case <-rf.shutdown:
+				rf.mu.Unlock()
 				DPrintf("[%d-%s]: peer %d is shutting down apply log entry to client daemon.\n", rf.me, rf, rf.me)
 				close(rf.applyCh)
 				return
