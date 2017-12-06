@@ -27,8 +27,6 @@ import (
 	"sort"
 )
 
-// import "bytes"
-// import "encoding/gob"
 var rng = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
 
 // filter out too close timeout
@@ -518,9 +516,10 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 					}
 					rf.matchIndex[n] = rf.nextIndex[n] - 1
 
-					rf.heartbeatCnt[n] = true
 					// it's leader's responsibility to update commitIndex, and must no hurry
 					if len(args.Entries) == 0 {
+						rf.heartbeatCnt[n] = true
+
 						// when get a heartbeat message from all followers
 						rf.updateCommitIndex()
 					}
