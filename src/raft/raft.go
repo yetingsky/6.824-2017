@@ -73,7 +73,6 @@ type Raft struct {
 	VotedFor     int          // Persisted before responding to RPCs
 	Logs         []LogEntry   // Persisted before responding to RPCs
 	commitCond   *sync.Cond   // for commitIndex update
-	heartbeatCnt map[int]bool // record heartbeat situation
 	newEntryCond []*sync.Cond // for new log entry
 	commitIndex  int          // Volatile state on all servers
 	lastApplied  int          // Volatile state on all servers
@@ -183,8 +182,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf("[%d-%s]: rpc RV, from peer: %d, arg term: %d, my term: %d\n",
-		rf.me, rf, args.CandidateID, args.Term, rf.CurrentTerm)
+	lastLogIdx := len(rf.Logs) - 1
+	lastLogTerm := rf.Logs[lastLogIdx].Term
+
+	DPrintf("[%d-%s]: rpc RV, from peer: %d, arg term: %d, my term: %d (last log idx: %d->%d, term: %d->%d)\n",
+		rf.me, rf, args.CandidateID, args.Term, rf.CurrentTerm, args.LastLogIndex, lastLogIdx, args.LastLogTerm, lastLogTerm)
 
 	// Your code here (2A, 2B).
 	if args.Term < rf.CurrentTerm {
@@ -200,8 +202,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		// if is null (follower) or itself is a candidate (or stale leader) with same term
 		if rf.VotedFor == -1 { //|| (rf.VotedFor == rf.me && !sameTerm) { //|| rf.votedFor == args.CandidateID {
-			lastLogIdx := len(rf.Logs) - 1
-			lastLogTerm := rf.Logs[lastLogIdx].Term
 
 			// check whether candidate's log is at-least-as update
 			if (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIdx) ||
@@ -333,7 +333,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				last = len(rf.Logs) - 1
 			}
 		}
-		//DPrintf("[%d-%s]: logs: %v\n", rf.me, rf, rf.logs)
+		// truncate to known matched
+		rf.Logs = rf.Logs[:last+1]
+
 		// min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
 			if last < args.LeaderCommit {
@@ -366,9 +368,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		var first = 1
 		reply.ConflictTerm = preLogTerm
 		if reply.ConflictTerm == 0 {
-			if len(rf.Logs) != 1 {
-				first = len(rf.Logs)
-			}
+			// which means leader has more logs or follower has no log at all
+			first = len(rf.Logs)
+			reply.ConflictTerm = rf.Logs[first-1].Term
 		} else {
 			for i := preLogIdx - 1; i > 0; i-- {
 				if rf.Logs[i].Term != preLogTerm {
@@ -453,10 +455,6 @@ func (rf *Raft) wakeupConsistencyCheck() {
 func (rf *Raft) consistencyCheckDaemon(n int) {
 	for {
 		rf.mu.Lock()
-		if !rf.isLeader {
-			rf.mu.Unlock()
-			return
-		}
 		rf.newEntryCond[n].Wait()
 		select {
 		case <-rf.shutdown:
@@ -489,43 +487,39 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 			rf.mu.Unlock()
 
 			// Wait until timeout? Need a way to give up (timeout)
+			// rpc timeout
 			timeout := time.NewTimer(rf.heartbeatInterval / 2)
-			replyCh := make(chan struct{}, 1)
+			replyCh := make(chan bool, 1)
 			go func() {
-				rf.sendAppendEntries(n, &args, &reply)
-				replyCh <- struct{}{}
+				ok := rf.sendAppendEntries(n, &args, &reply)
+				replyCh <- ok
 			}()
 
 			select {
 			case <-timeout.C:
-				// DPrintf("[%d-%s]: AE failed, no reply from remote server\n", rf.me, rf)
-				// avoid goroutines leak
-			case <-replyCh:
+				DPrintf("[%d-%s]: AE rpc to peer %d timeout, no valid reply from remote server\n",
+					rf.me, rf, n)
+			case ok := <-replyCh:
 				if !timeout.Stop() {
-					//DPrintf("[%d-%s]: timeout stop failed.", rf.me, rf)
 					<-timeout.C
+				}
+				if !ok {
+					DPrintf("[%d-%s]: AE rpc to peer %d failed, no valid reply from remote server\n",
+						rf.me, rf, n)
+					return
 				}
 				rf.mu.Lock()
 				if reply.Success {
 					// RPC and consistency check successful
-					if len(args.Entries) > 0 {
-						rf.nextIndex[n] += len(args.Entries)
-					}
+					rf.nextIndex[n] += len(args.Entries)
 					if rf.nextIndex[n] > len(rf.Logs) {
 						rf.nextIndex[n] = len(rf.Logs)
 					}
 					rf.matchIndex[n] = rf.nextIndex[n] - 1
 
-					// it's leader's responsibility to update commitIndex, and must no hurry
-					if len(args.Entries) == 0 {
-						rf.heartbeatCnt[n] = true
-
-						// when get a heartbeat message from all followers
-						rf.updateCommitIndex()
-					}
+					// it's leader's responsibility to update commitIndex
+					rf.updateCommitIndex()
 				} else {
-					rf.heartbeatCnt[n] = false
-					// DPrintf("[%d-%s]: AE failed, term -> arg: %d, reply: %d\n", rf.me, rf, args.Term, reply.CurrentTerm)
 					// found a new leader, turn to follower
 					if reply.CurrentTerm > args.Term {
 						// update if necessary
@@ -534,10 +528,10 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 							rf.VotedFor = -1
 						}
 						if rf.isLeader {
+							rf.isLeader = false
 							rf.commitCond.Broadcast()
 							rf.wakeupConsistencyCheck()
 						}
-						rf.isLeader = false
 						rf.persist()
 						rf.mu.Unlock()
 
@@ -561,6 +555,9 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 							}
 						}
 						if know {
+							if lastIndex > reply.FirstIndex {
+								lastIndex = reply.FirstIndex
+							}
 							rf.nextIndex[n] = lastIndex
 						} else {
 							rf.nextIndex[n] = reply.FirstIndex
@@ -610,19 +607,21 @@ func (rf *Raft) logEntryAgreeDaemon() {
 // Only leader can issue heartbeat message.
 func (rf *Raft) heartbeatDaemon() {
 	for {
-		time.Sleep(rf.heartbeatInterval)
-		select {
-		case <-rf.shutdown:
-			DPrintf("[%d-%s]: peer %d is closing heartbeatDaemon.\n", rf.me, rf, rf.me)
-			return
-		default:
-		}
 		if _, isLeader := rf.GetState(); isLeader {
 			// reset leader's election timer
 			rf.resetTimer <- struct{}{}
 			rf.wakeupConsistencyCheck()
 		} else {
 			break
+		}
+
+		time.Sleep(rf.heartbeatInterval)
+
+		select {
+		case <-rf.shutdown:
+			DPrintf("[%d-%s]: peer %d is closing heartbeatDaemon.\n", rf.me, rf, rf.me)
+			return
+		default:
 		}
 	}
 }
@@ -638,30 +637,14 @@ func (rf *Raft) updateCommitIndex() {
 
 	target := match[len(rf.peers)/2]
 	if rf.commitIndex < target {
-		cnt := 1 // leader itself is always ok
-		for _, v := range rf.heartbeatCnt {
-			if v {
-				cnt++
-			}
-		}
-		// when majority heartbeat success, then try to update commit index, should be conservative
-		if cnt > len(rf.peers)/2 {
-			// clear
-			for i := 0; i < len(rf.peers); i++ {
-				rf.heartbeatCnt[i] = false
-			}
-		} else {
-			return
-		}
-
 		if rf.Logs[target].Term == rf.CurrentTerm {
 			DPrintf("[%d-%s]: leader %d update commit index %d -> %d @ term %d\n",
 				rf.me, rf, rf.me, rf.commitIndex, target, rf.CurrentTerm)
 			rf.commitIndex = target
 			go func() { rf.commitCond.Broadcast() }()
 		} else {
-			DPrintf("[%d-%s]: leader %d update commit failed (log term %d != current Term %d)\n",
-				rf.me, rf, rf.me, rf.Logs[target].Term, rf.CurrentTerm)
+			DPrintf("[%d-%s]: leader %d update commit index %d failed (log term %d != current Term %d)\n",
+				rf.me, rf, rf.me, rf.commitIndex, rf.Logs[target].Term, rf.CurrentTerm)
 		}
 	}
 }
@@ -712,7 +695,7 @@ func (rf *Raft) applyLogEntryDaemon() {
 		rf.mu.Unlock()
 
 		for i := 0; i < cur-last; i++ {
-			// current command is replicated
+			// current command is replicated, ignore nil command
 			reply := ApplyMsg{
 				Index:   last + i + 1,
 				Command: logs[i].Command,
@@ -753,21 +736,25 @@ func (rf *Raft) canvassVotes() {
 				defer wg.Done()
 				var reply RequestVoteReply
 
-				doneCh := make(chan struct{}, 1)
+				doneCh := make(chan bool, 1)
 
-				// timeout same with heartbeat
-				timeout := time.NewTimer(rf.heartbeatInterval)
+				// rpc timeout
+				timeout := time.NewTimer(rf.electionTimeout / 2)
 				go func() {
-					rf.sendRequestVote(n, &voteArgs, &reply)
-					doneCh <- struct{}{}
+					ok := rf.sendRequestVote(n, &voteArgs, &reply)
+					doneCh <- ok
 				}()
 
 				select {
 				case <-timeout.C:
-				case <-doneCh:
+					DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d timeout.\n", rf.me, rf, n)
+				case ok := <-doneCh:
 					if !timeout.Stop() {
-						//DPrintf("[%d-%s]: timeout stop failed.", rf.me, rf)
 						<-timeout.C
+					}
+					if !ok {
+						DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d failed.\n", rf.me, rf, n)
+						return
 					}
 					replyCh <- reply
 				}
@@ -810,6 +797,9 @@ func (rf *Raft) canvassVotes() {
 			return
 		}
 	}
+
+	// reset timer, wait another election interval
+	// rf.resetTimer <- struct{}{}
 }
 
 func (rf *Raft) String() string {
@@ -842,15 +832,17 @@ func (rf *Raft) electionDaemon() {
 			DPrintf("[%d-%s]: peer %d is shutting down.\n", rf.me, rf, rf.me)
 			return
 		case <-rf.resetTimer:
+			if !rf.electionTimer.Stop() {
+				<-rf.electionTimer.C
+			}
 			rf.electionTimer.Reset(rf.electionTimeout)
 		case <-rf.electionTimer.C:
-			rf.electionTimer.Reset(rf.electionTimeout)
-
 			rf.mu.Lock()
 			DPrintf("[%d-%s]: peer %d election timeout, issue election @ term %d\n",
 				rf.me, rf, rf.me, rf.CurrentTerm)
 			rf.mu.Unlock()
 			go rf.canvassVotes()
+			rf.electionTimer.Reset(rf.electionTimeout)
 		}
 	}
 }
@@ -933,8 +925,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i := 0; i < len(peers); i++ {
 		rf.newEntryCond[i] = sync.NewCond(&rf.mu)
 	}
-
-	rf.heartbeatCnt = make(map[int]bool)
 
 	// heartbeat: 200ms
 	rf.heartbeatInterval = time.Millisecond * 200
