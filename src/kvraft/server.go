@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"bytes"
 )
 
 const Debug = 0
@@ -42,6 +43,7 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persist   *raft.Persister
 	db        map[string]string
 	notifyChs map[int]chan struct{}
 
@@ -90,7 +92,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	case <-ch:
 		// lose leadership
 		curTerm, isLeader := kv.rf.GetState()
-		// TODO: what if still leader, but different term ?
+		// what if still leader, but different term? let client retry
 		if !isLeader || term != curTerm {
 			reply.WrongLeader = true
 			reply.Err = ""
@@ -152,7 +154,6 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 		// lose leadership
 		curTerm, isLeader := kv.rf.GetState()
-		// TODO: what if still leader, but different term? it means it's replaced by other client's cmd?
 		if !isLeader || term != curTerm {
 			reply.WrongLeader = true
 			reply.Err = ""
@@ -173,45 +174,90 @@ func (kv *RaftKV) applyDaemon() {
 			return
 		case msg, ok := <-kv.applyCh:
 			if ok {
-				cmd := msg.Command.(Op)
-				kv.mu.Lock()
-				switch cmd.Op {
-				case "Get":
-					dup, ok := kv.duplicate[cmd.ClientID]
-					if !ok || dup.seq < cmd.SeqNo {
-						kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo,
-							reply: &GetReply{Value: kv.db[cmd.Key],}}
-					}
-				case "Put":
-					dup, ok := kv.duplicate[cmd.ClientID]
-					if !ok || dup.seq < cmd.SeqNo {
-						kv.db[cmd.Key] = cmd.Value
-						kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo, reply: nil}
-					}
-				case "Append":
-					dup, ok := kv.duplicate[cmd.ClientID]
-					if !ok || dup.seq < cmd.SeqNo {
-						kv.db[cmd.Key] += cmd.Value
-						kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo, reply: nil}
-					}
-				default:
-					DPrintf("[%d]: server %d receive invalid cmd: %v\n", kv.me, kv.me, cmd)
+				// have snapshot to apply?
+				if msg.UseSnapshot {
+					kv.readSnapshot(msg.Snapshot)
 				}
-				// notify channel
-				notifyCh := kv.notifyChs[msg.Index]
-				kv.mu.Unlock()
 
-				// notify client if it is or was leader
-				_, isLeader := kv.rf.GetState()
-				if isLeader && notifyCh != nil {
-					notifyCh <- struct{}{}
-				} else if notifyCh != nil {
-					// lose leadership, notify blocked chan receiver
-					close(notifyCh)
+				// have client's request?
+				if msg.Command != nil {
+					cmd := msg.Command.(Op)
+					kv.mu.Lock()
+					dup, ok := kv.duplicate[cmd.ClientID]
+					if !ok || dup.seq < cmd.SeqNo {
+						switch cmd.Op {
+						case "Get":
+							kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo,
+								reply: &GetReply{Value: kv.db[cmd.Key],}}
+						case "Put":
+							kv.db[cmd.Key] = cmd.Value
+							kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo, reply: nil}
+						case "Append":
+							kv.db[cmd.Key] += cmd.Value
+							kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo, reply: nil}
+						default:
+							DPrintf("[%d]: server %d receive invalid cmd: %v\n", kv.me, kv.me, cmd)
+						}
+
+						// snapshot detection: up through msg.Index
+						if needSnapshot(kv) {
+							// save snapshot and notify raft
+							DPrintf("[%d]: server %d need generate snapshot @ %d.\n", kv.me, kv.me, msg.Index)
+							kv.generateSnapshot()
+							kv.rf.NewSnapShot(msg.Index)
+						}
+					}
+					// notify channel
+					notifyCh := kv.notifyChs[msg.Index]
+					kv.mu.Unlock()
+
+					// notify client if it is or was leader
+					_, isLeader := kv.rf.GetState()
+					if isLeader && notifyCh != nil {
+						notifyCh <- struct{}{}
+					} else if notifyCh != nil {
+						// lose leadership, notify blocked chan receiver
+						close(notifyCh)
+					}
 				}
 			}
 		}
 	}
+}
+
+// 100bytes
+func needSnapshot(kv *RaftKV) bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	if kv.maxraftstate > kv.persist.RaftStateSize() &&
+		kv.maxraftstate-kv.persist.RaftStateSize() < 100 {
+		return true
+	}
+	return false
+}
+
+// which index?
+func (kv *RaftKV) generateSnapshot() {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	e.Encode(kv.db)
+	e.Encode(kv.duplicate)
+
+	data := w.Bytes()
+	kv.persist.SaveSnapshot(data)
+}
+
+func (kv *RaftKV) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	d.Decode(&kv.db)
+	d.Decode(&kv.duplicate)
 }
 
 //
@@ -249,7 +295,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
@@ -257,12 +302,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// store key-value pairs
 	kv.db = make(map[string]string)
 	kv.notifyChs = make(map[int]chan struct{})
+	kv.persist = persister
 
 	// shutdown channel
 	kv.shutdownCh = make(chan struct{})
 
 	// duplication detection table: client->seq no.-> reply
 	kv.duplicate = make(map[int64]*LatestReply)
+
+	// read snapshot when start
+	kv.readSnapshot(kv.persist.ReadSnapshot())
 
 	go kv.applyDaemon()
 

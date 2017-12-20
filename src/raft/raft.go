@@ -93,8 +93,31 @@ type Raft struct {
 	nextIndex    []int        // Leader only, reinitialized after election
 	matchIndex   []int        // Leader only, reinitialized after election
 
-	applyCh  chan ApplyMsg // outgoing channel to service
-	shutdown chan struct{} // shutdown channel, shut raft instance gracefully
+	snapshotIndex int // snapshot last included index
+	snapshotTerm  int // snapshot last included term
+
+	applyCh    chan ApplyMsg // outgoing channel to service
+	shutdownCh chan struct{} // shutdown channel, shut raft instance gracefully
+}
+
+func (rf *Raft) NewSnapShot(index int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.snapshotIndex {
+		panic("NewSnapShot: index < rf.snapshotIndex")
+	}
+	// including the last of snapshot's log entry
+	rf.Logs = rf.Logs[index-rf.snapshotIndex:]
+
+	rf.snapshotIndex = index
+	rf.snapshotTerm = rf.Logs[index-rf.snapshotIndex].Term
+}
+
+// unlocked version, should be called when holding the lock
+func (rf *Raft) lastLogIndexAndTerm() (int, int) {
+	index := rf.snapshotIndex + len(rf.Logs) - 1
+	term := rf.Logs[index-rf.snapshotIndex].Term
+	return index, term
 }
 
 // return currentTerm and whether this server
@@ -125,6 +148,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Logs)
+	e.Encode(rf.snapshotIndex)
+	e.Encode(rf.snapshotTerm)
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -144,6 +169,8 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.CurrentTerm)
 	d.Decode(&rf.VotedFor)
 	d.Decode(&rf.Logs)
+	d.Decode(&rf.snapshotIndex)
+	d.Decode(&rf.snapshotTerm)
 }
 
 //
@@ -168,8 +195,7 @@ func (rf *Raft) fillRequestVoteArgs(args *RequestVoteArgs) {
 
 	args.Term = rf.CurrentTerm
 	args.CandidateID = rf.me
-	args.LastLogIndex = len(rf.Logs) - 1
-	args.LastLogTerm = rf.Logs[args.LastLogIndex].Term
+	args.LastLogIndex, args.LastLogTerm = rf.lastLogIndexAndTerm()
 }
 
 //
@@ -187,7 +213,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	select {
-	case <-rf.shutdown:
+	case <-rf.shutdownCh:
 		DPrintf("[%d-%s]: peer %d is shutting down, reject RV rpc request.\n", rf.me, rf, rf.me)
 		return
 	default:
@@ -196,8 +222,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	lastLogIdx := len(rf.Logs) - 1
-	lastLogTerm := rf.Logs[lastLogIdx].Term
+	lastLogIdx, lastLogTerm := rf.lastLogIndexAndTerm()
 
 	DPrintf("[%d-%s]: rpc RV, from peer: %d, arg term: %d, my term: %d (last log idx: %d->%d, term: %d->%d)\n",
 		rf.me, rf, args.CandidateID, args.Term, rf.CurrentTerm, args.LastLogIndex, lastLogIdx, args.LastLogTerm, lastLogTerm)
@@ -287,10 +312,19 @@ type AppendEntriesReply struct {
 	FirstIndex   int // the first index it stores for ConflictTerm
 }
 
+// should be called when holding lock
+func (rf *Raft) turnToFollow() {
+	rf.isLeader = false
+	rf.VotedFor = -1
+
+	rf.commitCond.Broadcast()
+	rf.wakeupConsistencyCheck()
+}
+
 // AppendEntries handler, including heartbeat, must backup quickly
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	select {
-	case <-rf.shutdown:
+	case <-rf.shutdownCh:
 		DPrintf("[%d-%s]: peer %d is shutting down, reject AE rpc request.\n", rf.me, rf, rf.me)
 		return
 	default:
@@ -307,36 +341,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	if rf.CurrentTerm < args.Term {
+		rf.CurrentTerm = args.Term
+	}
 
 	// for stale leader
 	if rf.isLeader {
-		rf.isLeader = false
-		rf.commitCond.Broadcast()
-		rf.wakeupConsistencyCheck()
+		rf.turnToFollow()
 	}
 	// for straggler (follower)
 	if rf.VotedFor != args.LeaderID {
 		rf.VotedFor = args.LeaderID
 	}
-	if rf.CurrentTerm < args.Term {
-		rf.CurrentTerm = args.Term
-	}
+
 	// valid AE, reset election timer
 	rf.resetTimer <- struct{}{}
 
+	if args.PrevLogIndex < rf.snapshotIndex {
+		panic("Append Entry: args.PrevLogIndex < rf.snapshotIndex")
+	}
+
 	preLogIdx, preLogTerm := 0, 0
-	if len(rf.Logs) > args.PrevLogIndex {
+	if args.PrevLogIndex < len(rf.Logs)+rf.snapshotIndex {
 		preLogIdx = args.PrevLogIndex
-		preLogTerm = rf.Logs[preLogIdx].Term
+		preLogTerm = rf.Logs[preLogIdx-rf.snapshotIndex].Term
 	}
 
 	// last log is match
 	if preLogIdx == args.PrevLogIndex && preLogTerm == args.PrevLogTerm {
 		reply.Success = true
 		// truncate to known match
-		rf.Logs = rf.Logs[:preLogIdx+1]
+		rf.Logs = rf.Logs[:preLogIdx+1-rf.snapshotIndex]
 		rf.Logs = append(rf.Logs, args.Entries...)
-		var last = len(rf.Logs) - 1
+		var last = rf.snapshotIndex + len(rf.Logs) - 1
 
 		// min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
@@ -345,7 +382,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			go func() { rf.commitCond.Broadcast() }()
 		}
 		// tell leader to update matched index
-		reply.ConflictTerm = rf.Logs[last].Term
+		reply.ConflictTerm = rf.Logs[last-rf.snapshotIndex].Term
 		reply.FirstIndex = last
 
 		if len(args.Entries) > 0 {
@@ -367,24 +404,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 		move nextIndex[i] back to leader's last entry for the conflicting term
 		// else:
 		// 		move nextIndex[i] back to follower's first index
-		var first = 1
+		var first = 1 + rf.snapshotIndex
 		reply.ConflictTerm = preLogTerm
 		if reply.ConflictTerm == 0 {
 			// which means leader has more logs or follower has no log at all
-			first = len(rf.Logs)
-			reply.ConflictTerm = rf.Logs[first-1].Term
+			first = len(rf.Logs) + rf.snapshotIndex
+			reply.ConflictTerm = rf.Logs[first-1-rf.snapshotIndex].Term
 		} else {
-			for i := preLogIdx - 1; i > 0; i-- {
-				if rf.Logs[i].Term != preLogTerm {
+			i := preLogIdx - 1
+			for ; i > rf.snapshotIndex; i-- {
+				if rf.Logs[i-rf.snapshotIndex].Term != preLogTerm {
 					first = i + 1
 					break
 				}
 			}
 		}
 		reply.FirstIndex = first
-		if len(rf.Logs) <= args.PrevLogIndex {
+		if len(rf.Logs)+rf.snapshotIndex <= args.PrevLogIndex {
 			DPrintf("[%d-%s]: AE failed from leader %d, leader has more logs (%d > %d), reply: %d - %d.\n",
-				rf.me, rf, args.LeaderID, args.PrevLogIndex, len(rf.Logs)-1, reply.ConflictTerm, reply.FirstIndex)
+				rf.me, rf, args.LeaderID, args.PrevLogIndex, len(rf.Logs)-1+rf.snapshotIndex, reply.ConflictTerm,
+				reply.FirstIndex)
 		} else {
 			DPrintf("[%d-%s]: AE failed from leader %d, pre idx/term mismatch (%d != %d, %d != %d).\n",
 				rf.me, rf, args.LeaderID, args.PrevLogIndex, preLogIdx, args.PrevLogTerm, preLogTerm)
@@ -396,6 +435,85 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // bool is not useful
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// InstallSnapShot RPC
+type InstallSnapshotArgs struct {
+	Term              int // leader's term
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Snapshot          []byte
+}
+
+type InstallSnapshotReply struct {
+	CurrentTerm int // for leader to update itself
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	select {
+	case <-rf.shutdownCh:
+		DPrintf("[%d-%s]: peer %d is shutting down, reject install snapshot rpc request.\n",
+			rf.me, rf, rf.me)
+		return
+	default:
+	}
+
+	DPrintf("[%d-%s]: rpc snapshot, from peer: %d, term: %d\n", rf.me, rf, args.LeaderID, args.Term)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.CurrentTerm = rf.CurrentTerm
+
+	if args.Term < rf.CurrentTerm {
+		DPrintf("[%d-%s]: rpc snapshot, args.term < rf.CurrentTerm (%d < %d)\n", rf.me, rf,
+			args.Term, rf.CurrentTerm)
+		return
+	}
+
+	// may have duplicate snapshot
+	if args.LastIncludedIndex <= rf.snapshotIndex {
+		DPrintf("[%d-%s]: rpc snapshot, args.LastIncludedIndex < rf.snapshotIndex (%d < %d)\n", rf.me, rf,
+			args.LastIncludedIndex, rf.snapshotIndex)
+		return
+	}
+
+	rf.resetTimer <- struct{}{}
+
+	// snapshot have all logs
+	if args.LastIncludedIndex >= rf.snapshotIndex+len(rf.Logs)-1 {
+		DPrintf("[%d-%s]: rpc snapshot, snapshot have all logs (%d >= %d + %d - 1).\n", rf.me, rf,
+			args.LastIncludedIndex, rf.snapshotIndex, len(rf.Logs))
+
+		rf.snapshotIndex = args.LastIncludedIndex
+		rf.snapshotTerm = args.LastIncludedTerm
+		rf.commitIndex = rf.snapshotIndex
+		rf.lastApplied = rf.snapshotIndex
+		rf.Logs = []LogEntry{{rf.snapshotTerm, nil},}
+
+		rf.applyCh <- ApplyMsg{-1, nil, true, args.Snapshot}
+		rf.persist()
+		return
+	}
+
+	// snapshot contains part of logs
+	DPrintf("[%d-%s]: rpc snapshot, snapshot have some logs (%d < %d + %d - 1).\n", rf.me, rf,
+		args.LastIncludedIndex, rf.snapshotIndex, len(rf.Logs))
+
+	rf.Logs = rf.Logs[args.LastIncludedIndex-rf.snapshotIndex:]
+	rf.snapshotIndex = args.LastIncludedIndex
+	rf.snapshotTerm = args.LastIncludedTerm
+	rf.commitIndex = rf.snapshotIndex
+	rf.lastApplied = rf.snapshotIndex
+
+	rf.applyCh <- ApplyMsg{-1, nil, true, args.Snapshot}
+	rf.persist()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -415,7 +533,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index, term, isLeader := -1, 0, false
 	select {
-	case <-rf.shutdown:
+	case <-rf.shutdownCh:
 		return index, term, isLeader
 	default:
 	}
@@ -427,7 +545,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		log := LogEntry{rf.CurrentTerm, command}
 		rf.Logs = append(rf.Logs, log)
 
-		index = len(rf.Logs) - 1
+		index = len(rf.Logs) - 1 + rf.snapshotIndex
 		term = rf.CurrentTerm
 		isLeader = true
 
@@ -453,12 +571,71 @@ func (rf *Raft) wakeupConsistencyCheck() {
 	}
 }
 
+// n: which follower
+func (rf *Raft) consistencyCheckReplyHandler(n int, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Success {
+		// RPC and consistency check successful
+		rf.matchIndex[n] = reply.FirstIndex
+		rf.nextIndex[n] = rf.matchIndex[n] + 1
+
+		// it's leader's responsibility to update commitIndex
+		rf.updateCommitIndex()
+	} else {
+		// found a new leader, turn to follower
+		if rf.isLeader && reply.CurrentTerm > rf.CurrentTerm {
+			if rf.isLeader {
+				rf.turnToFollow()
+			}
+			rf.persist()
+			rf.resetTimer <- struct{}{}
+			DPrintf("[%d-%s]: leader %d found new term (heartbeat resp from peer %d), turn to follower.",
+				rf.me, rf, rf.me, n)
+			return
+		}
+
+		// Does leader know conflicting term?
+		var know, lastIndex = false, 0
+		if reply.ConflictTerm != 0 {
+			for i := len(rf.Logs) - 1; i > 0; i-- {
+				if rf.Logs[i].Term == reply.ConflictTerm {
+					know = true
+					lastIndex = i + rf.snapshotIndex
+					DPrintf("[%d-%s]: leader %d have entry %d is the last entry in term %d.",
+						rf.me, rf, rf.me, i, reply.ConflictTerm)
+					break
+				}
+			}
+			if know {
+				rf.nextIndex[n] = min(lastIndex, reply.FirstIndex)
+			} else {
+				rf.nextIndex[n] = reply.FirstIndex
+			}
+		} else {
+			rf.nextIndex[n] = reply.FirstIndex
+		}
+
+		// TODO: need send snapshot?
+		if rf.snapshotIndex != 0 && rf.nextIndex[n] <= rf.snapshotIndex {
+			DPrintf("[%d-%s]: peer %d need snapshot, rf.nextIndex <= rf.snapshotIndex (%d < %d).\n",
+				rf.me, rf, n, rf.nextIndex[n], rf.snapshotIndex)
+			rf.sendSnapshot(n)
+		} else {
+			// snapshot + 1 <= rf.nextIndex[n] <= len(rf.Logs) + snapshot
+			rf.nextIndex[n] = min(max(rf.nextIndex[n], 1+rf.snapshotIndex), len(rf.Logs)+rf.snapshotIndex)
+			DPrintf("[%d-%s]: nextIndex for %d  => %d.\n", rf.me, rf, n, rf.nextIndex[n])
+		}
+	}
+}
+
 func (rf *Raft) consistencyCheckDaemon(n int) {
 	for {
 		rf.mu.Lock()
 		rf.newEntryCond[n].Wait()
 		select {
-		case <-rf.shutdown:
+		case <-rf.shutdownCh:
 			rf.mu.Unlock()
 			rf.wakeupConsistencyCheck()
 			DPrintf("[%d-%s]: leader %d is closing consistency check daemon for peer %d.\n", rf.me, rf, rf.me, n)
@@ -467,101 +644,77 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 		}
 
 		if rf.isLeader {
-			var args AppendEntriesArgs
-			args.Term = rf.CurrentTerm
-			args.LeaderID = rf.me
-			args.LeaderCommit = rf.commitIndex
-			args.PrevLogIndex = rf.nextIndex[n] - 1
-			args.PrevLogTerm = rf.Logs[args.PrevLogIndex].Term
-
-			if rf.nextIndex[n] < len(rf.Logs) {
-				// new or missing entries
-				args.Entries = append(args.Entries, rf.Logs[rf.nextIndex[n]:]...)
+			// TODO: what if rf.nextIndex[n]-1 < snapshotIndex? just send snapshot?
+			pre := rf.nextIndex[n] - 1
+			if pre < rf.snapshotIndex {
+				rf.mu.Unlock()
+				rf.sendSnapshot(n)
 			} else {
-				// heartbeat
-				args.Entries = nil
-			}
-			rf.mu.Unlock()
-
-			// Wait until timeout? Need a way to give up (timeout)
-			replyCh := make(chan AppendEntriesReply, 1)
-			go func() {
-				var reply AppendEntriesReply
-				if rf.sendAppendEntries(n, &args, &reply) {
-					replyCh <- reply
+				var args = AppendEntriesArgs{
+					Term:         rf.CurrentTerm,
+					LeaderID:     rf.me,
+					PrevLogIndex: pre,
+					PrevLogTerm:  rf.Logs[pre-rf.snapshotIndex].Term,
+					Entries:      nil,
+					LeaderCommit: rf.commitIndex,
 				}
-			}()
-
-			select {
-			case <-time.After(rf.heartbeatInterval / 2): // rpc timeout
-				DPrintf("[%d-%s]: AE rpc to peer %d timeout, no valid reply from remote server\n",
-					rf.me, rf, n)
-			case reply := <-replyCh:
-				rf.mu.Lock()
-				if reply.Success {
-					// RPC and consistency check successful
-					rf.matchIndex[n] = reply.FirstIndex
-					rf.nextIndex[n] = rf.matchIndex[n] + 1
-
-					// it's leader's responsibility to update commitIndex
-					rf.updateCommitIndex()
-				} else {
-					// found a new leader, turn to follower
-					if reply.CurrentTerm > args.Term {
-						// update if necessary
-						if reply.CurrentTerm > rf.CurrentTerm {
-							rf.CurrentTerm = reply.CurrentTerm
-							rf.VotedFor = -1
-						}
-						if rf.isLeader {
-							rf.isLeader = false
-							rf.commitCond.Broadcast()
-							rf.wakeupConsistencyCheck()
-						}
-						rf.persist()
-						rf.mu.Unlock()
-
-						rf.resetTimer <- struct{}{}
-						DPrintf("[%d-%s]: leader %d found new term (heartbeat resp from peer %d), turn to follower.",
-							rf.me, rf, rf.me, n)
-						return
-					}
-
-					// with extra info, leader can be more clever
-					// Does leader know conflicting term?
-					var know, lastIndex = false, 0
-					if reply.ConflictTerm != 0 {
-						for i := len(rf.Logs) - 1; i > 0; i-- {
-							if rf.Logs[i].Term == reply.ConflictTerm {
-								know = true
-								lastIndex = i
-								DPrintf("[%d-%s]: leader %d have entry %d is the last entry in term %d.",
-									rf.me, rf, rf.me, i, reply.ConflictTerm)
-								break
-							}
-						}
-						if know {
-							if lastIndex > reply.FirstIndex {
-								lastIndex = reply.FirstIndex
-							}
-							rf.nextIndex[n] = lastIndex
-						} else {
-							rf.nextIndex[n] = reply.FirstIndex
-						}
-					} else {
-						rf.nextIndex[n] = reply.FirstIndex
-					}
-					// 1<= rf.nextIndex[n] <= len(rf.Logs)
-					rf.nextIndex[n] = min(max(rf.nextIndex[n], 1), len(rf.Logs))
+				if rf.nextIndex[n] < len(rf.Logs)+rf.snapshotIndex {
+					args.Entries = append(args.Entries, rf.Logs[rf.nextIndex[n]-rf.snapshotIndex:]...)
 				}
 				rf.mu.Unlock()
+
+				// Wait until timeout? Need a way to give up (timeout)
+				replyCh := make(chan *AppendEntriesReply, 1)
+				go func() {
+					var reply AppendEntriesReply
+					if rf.sendAppendEntries(n, &args, &reply) {
+						replyCh <- &reply
+					}
+				}()
+
+				select {
+				case <-time.After(rf.heartbeatInterval / 2): // rpc timeout
+					DPrintf("[%d-%s]: AE rpc to peer %d timeout, no valid reply from remote server\n",
+						rf.me, rf, n)
+				case reply := <-replyCh:
+					rf.consistencyCheckReplyHandler(n, reply)
+				}
 			}
-			// ignore false and retry indefinitely
 		} else {
 			rf.mu.Unlock()
 			return
 		}
 	}
+}
+
+func (rf *Raft) sendSnapshot(server int) {
+	var args InstallSnapshotArgs
+	args.Term = rf.CurrentTerm
+	args.LastIncludedIndex = rf.snapshotIndex
+	args.LastIncludedTerm = rf.snapshotTerm
+	args.LeaderID = rf.me
+	args.Snapshot = rf.persister.ReadSnapshot()
+
+	replayHandler := func(server int, reply *InstallSnapshotReply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// still leader?
+		if rf.isLeader {
+			if reply.CurrentTerm > rf.CurrentTerm {
+				rf.CurrentTerm = reply.CurrentTerm
+				rf.turnToFollow()
+				return
+			}
+			rf.nextIndex[server] = rf.snapshotIndex + 1
+		}
+	}
+
+	go func() {
+		var reply InstallSnapshotReply
+		if rf.sendInstallSnapshot(server, &args, &reply) {
+			replayHandler(server, &reply)
+		}
+	}()
 }
 
 // Check on this:
@@ -597,7 +750,7 @@ func (rf *Raft) heartbeatDaemon() {
 		time.Sleep(rf.heartbeatInterval)
 
 		select {
-		case <-rf.shutdown:
+		case <-rf.shutdownCh:
 			DPrintf("[%d-%s]: peer %d is closing heartbeatDaemon.\n", rf.me, rf, rf.me)
 			return
 		default:
@@ -615,15 +768,15 @@ func (rf *Raft) updateCommitIndex() {
 		rf.me, rf, rf.me, rf.matchIndex, rf.CurrentTerm)
 
 	target := match[len(rf.peers)/2]
-	if rf.commitIndex < target {
-		if rf.Logs[target].Term == rf.CurrentTerm {
+	if rf.commitIndex < target && rf.snapshotIndex < target {
+		if rf.Logs[target-rf.snapshotIndex].Term == rf.CurrentTerm {
 			DPrintf("[%d-%s]: leader %d update commit index %d -> %d @ term %d\n",
 				rf.me, rf, rf.me, rf.commitIndex, target, rf.CurrentTerm)
 			rf.commitIndex = target
 			go func() { rf.commitCond.Broadcast() }()
 		} else {
 			DPrintf("[%d-%s]: leader %d update commit index %d failed (log term %d != current Term %d)\n",
-				rf.me, rf, rf.me, rf.commitIndex, rf.Logs[target].Term, rf.CurrentTerm)
+				rf.me, rf, rf.me, rf.commitIndex, rf.Logs[target-rf.snapshotIndex].Term, rf.CurrentTerm)
 		}
 	}
 }
@@ -639,7 +792,7 @@ func (rf *Raft) Kill() {
 	delete(timeout, rf.electionTimeout)
 	mu.Unlock()
 
-	close(rf.shutdown)
+	close(rf.shutdownCh)
 	rf.commitCond.Broadcast()
 	rf.wakeupConsistencyCheck()
 
@@ -655,9 +808,8 @@ func (rf *Raft) applyLogEntryDaemon() {
 		rf.mu.Lock()
 		for rf.lastApplied == rf.commitIndex {
 			rf.commitCond.Wait()
-			// check if need to shut down
 			select {
-			case <-rf.shutdown:
+			case <-rf.shutdownCh:
 				rf.mu.Unlock()
 				DPrintf("[%d-%s]: peer %d is shutting down apply log entry to client daemon.\n", rf.me, rf, rf.me)
 				close(rf.applyCh)
@@ -669,7 +821,8 @@ func (rf *Raft) applyLogEntryDaemon() {
 		if last < cur {
 			rf.lastApplied = rf.commitIndex
 			logs = make([]LogEntry, cur-last)
-			copy(logs, rf.Logs[last+1: cur+1])
+			// TODO: slice out of bounds?
+			copy(logs, rf.Logs[last+1-rf.snapshotIndex: cur+1-rf.snapshotIndex])
 		}
 		rf.mu.Unlock()
 
@@ -691,7 +844,7 @@ func (rf *Raft) applyLogEntryDaemon() {
 // canvassVotes issues RequestVote RPC
 func (rf *Raft) canvassVotes() {
 	select {
-	case <-rf.shutdown:
+	case <-rf.shutdownCh:
 		DPrintf("[%d-%s]: peer %d is shutting down canvass votes routine.\n", rf.me, rf, rf.me)
 		return
 	default:
@@ -714,15 +867,12 @@ func (rf *Raft) canvassVotes() {
 			go func(n int) {
 				defer wg.Done()
 				var reply RequestVoteReply
-
 				doneCh := make(chan bool, 1)
 
-				// rpc timeout
 				go func() {
 					ok := rf.sendRequestVote(n, &voteArgs, &reply)
 					doneCh <- ok
 				}()
-
 				select {
 				case <-time.After(rf.electionTimeout / 2):
 					DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d timeout.\n", rf.me, rf, n)
@@ -772,9 +922,6 @@ func (rf *Raft) canvassVotes() {
 			return
 		}
 	}
-
-	// reset timer, wait another election interval
-	// rf.resetTimer <- struct{}{}
 }
 
 func (rf *Raft) String() string {
@@ -788,7 +935,7 @@ func (rf *Raft) resetOnElection() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	count := len(rf.peers)
-	length := len(rf.Logs)
+	length := len(rf.Logs) + rf.snapshotIndex
 
 	for i := 0; i < count; i++ {
 		rf.matchIndex[i] = 0
@@ -799,11 +946,11 @@ func (rf *Raft) resetOnElection() {
 	}
 }
 
-// electionDaemon never exit, but can be reset
+// electionDaemon
 func (rf *Raft) electionDaemon() {
 	for {
 		select {
-		case <-rf.shutdown:
+		case <-rf.shutdownCh:
 			DPrintf("[%d-%s]: peer %d is shutting down.\n", rf.me, rf, rf.me)
 			return
 		case <-rf.resetTimer:
@@ -867,9 +1014,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.isLeader = false
 	rf.VotedFor = -1
 
-	rf.nextIndex = make([]int, len(peers))
-	rf.matchIndex = make([]int, len(peers))
-
 	// first index is 1
 	rf.Logs = make([]LogEntry, 1)
 	// placeholder
@@ -878,13 +1022,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Command: nil,
 	}
 
-	// shutdown raft gracefully
-	rf.shutdown = make(chan struct{})
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
-	// matchIndex is initialized to leader last log index+1
-	for i := 0; i < len(peers); i++ {
-		rf.nextIndex[i] = len(rf.Logs)
-	}
+	// shutdown raft gracefully
+	rf.shutdownCh = make(chan struct{})
 
 	// electionTimeout: 400~800 ms, 20 ms
 	rf.electionTimeout = generateElectionTimeout(me)
