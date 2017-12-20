@@ -63,7 +63,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	DPrintf("Clerk: Get: %s\n", key)
+	DPrintf("Clerk: Get: %q\n", key)
 	// You will have to modify this function.
 	cnt := len(ck.servers)
 	for {
