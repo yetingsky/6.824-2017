@@ -33,6 +33,13 @@ var rng = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
 var mu sync.Mutex
 var timeout = make(map[time.Duration]bool)
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -319,32 +326,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// last log is match
 	if preLogIdx == args.PrevLogIndex && preLogTerm == args.PrevLogTerm {
 		reply.Success = true
-
-		// check extra entry, if doesn't have in logs, append to local logs
-		// or nil for heartbeat
-		var last = preLogIdx
-		for i, log := range args.Entries {
-			if preLogIdx+i+1 < len(rf.Logs) {
-				rf.Logs[preLogIdx+i+1] = log
-				last = preLogIdx + i + 1
-			} else {
-				rf.Logs = append(rf.Logs, log)
-				last = len(rf.Logs) - 1
-			}
-		}
-		// truncate to known matched
-		rf.Logs = rf.Logs[:last+1]
+		// truncate to known match
+		rf.Logs = rf.Logs[:preLogIdx+1]
+		rf.Logs = append(rf.Logs, args.Entries...)
+		var last = len(rf.Logs) - 1
 
 		// min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
-			if last < args.LeaderCommit {
-				rf.commitIndex = last
-			} else {
-				rf.commitIndex = args.LeaderCommit
-			}
+			rf.commitIndex = min(args.LeaderCommit, last)
 			// signal possible update commit index
 			go func() { rf.commitCond.Broadcast() }()
 		}
+		// tell leader to update matched index
+		reply.ConflictTerm = rf.Logs[last].Term
+		reply.FirstIndex = last
+
 		if len(args.Entries) > 0 {
 			DPrintf("[%d-%s]: AE success from leader %d (%d cmd @ %d), commit index: l->%d, f->%d.\n",
 				rf.me, rf, args.LeaderID, len(args.Entries), preLogIdx+1, args.LeaderCommit, rf.commitIndex)
@@ -465,8 +461,6 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 
 		if rf.isLeader {
 			var args AppendEntriesArgs
-			var reply AppendEntriesReply
-
 			args.Term = rf.CurrentTerm
 			args.LeaderID = rf.me
 			args.LeaderCommit = rf.commitIndex
@@ -476,39 +470,31 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 			if rf.nextIndex[n] < len(rf.Logs) {
 				// new or missing entries
 				args.Entries = append(args.Entries, rf.Logs[rf.nextIndex[n]:]...)
-				//DPrintf("[%d-%s]: AE to follower %d @ log entry %d\n", rf.me, rf, n, rf.nextIndex[n])
 			} else {
 				// heartbeat
 				args.Entries = nil
-				//DPrintf("[%d-%s]: <heartbeat> to follower %d @ log entry %d\n", rf.me, rf, n, rf.nextIndex[n]-1)
 			}
 			rf.mu.Unlock()
 
 			// Wait until timeout? Need a way to give up (timeout)
-			replyCh := make(chan bool, 1)
+			replyCh := make(chan AppendEntriesReply, 1)
 			go func() {
-				ok := rf.sendAppendEntries(n, &args, &reply)
-				replyCh <- ok
+				var reply AppendEntriesReply
+				if rf.sendAppendEntries(n, &args, &reply) {
+					replyCh <- reply
+				}
 			}()
 
 			select {
 			case <-time.After(rf.heartbeatInterval / 2): // rpc timeout
 				DPrintf("[%d-%s]: AE rpc to peer %d timeout, no valid reply from remote server\n",
 					rf.me, rf, n)
-			case ok := <-replyCh:
-				if !ok {
-					DPrintf("[%d-%s]: AE rpc to peer %d failed, no valid reply from remote server\n",
-						rf.me, rf, n)
-					return
-				}
+			case reply := <-replyCh:
 				rf.mu.Lock()
 				if reply.Success {
 					// RPC and consistency check successful
-					rf.nextIndex[n] += len(args.Entries)
-					if rf.nextIndex[n] > len(rf.Logs) {
-						rf.nextIndex[n] = len(rf.Logs)
-					}
-					rf.matchIndex[n] = rf.nextIndex[n] - 1
+					rf.matchIndex[n] = reply.FirstIndex
+					rf.nextIndex[n] = rf.matchIndex[n] + 1
 
 					// it's leader's responsibility to update commitIndex
 					rf.updateCommitIndex()
