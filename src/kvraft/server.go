@@ -28,10 +28,9 @@ type Op struct {
 	SeqNo    int    // request sequence number
 }
 
-type LastReply struct {
-	latest int         // latest seq
-	seq    int         // last apply
-	reply  interface{} // last reply
+type LatestReply struct {
+	seq   int         // latest request
+	reply interface{} // latest reply
 }
 
 type RaftKV struct {
@@ -50,7 +49,7 @@ type RaftKV struct {
 	shutdownCh chan struct{}
 
 	// duplication detection table
-	duplicate map[int64]*LastReply
+	duplicate map[int64]*LatestReply
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
@@ -65,21 +64,17 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("[%d]: leader %d receive rpc: Get(%q).\n", kv.me, kv.me, args.Key)
 
 	kv.mu.Lock()
-	// duplicate get request
+	// duplicate put/append request
 	if dup, ok := kv.duplicate[args.ClientID]; ok {
-		if args.SeqNo == dup.seq {
+		// filter duplicate
+		if args.SeqNo <= dup.seq {
 			kv.mu.Unlock()
 			reply.WrongLeader = false
 			reply.Err = OK
 			reply.Value = dup.reply.(*GetReply).Value
 			return
 		}
-	} else {
-		kv.duplicate[args.ClientID] = new(LastReply)
 	}
-
-	// update latest seq no
-	kv.duplicate[args.ClientID].latest = args.SeqNo
 
 	cmd := Op{Key: args.Key, Op: "Get", ClientID: args.ClientID, SeqNo: args.SeqNo}
 	index, term, _ := kv.rf.Start(cmd)
@@ -130,17 +125,14 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// duplicate put/append request
 	if dup, ok := kv.duplicate[args.ClientID]; ok {
 		// filter duplicate
-		if args.SeqNo <= dup.latest {
+		if args.SeqNo <= dup.seq {
 			kv.mu.Unlock()
 			reply.WrongLeader = false
 			reply.Err = OK
 			return
 		}
-	} else {
-		kv.duplicate[args.ClientID] = new(LastReply)
 	}
 
-	kv.duplicate[args.ClientID].latest = args.SeqNo
 	// new request
 	cmd := Op{Key: args.Key, Value: args.Value, Op: args.Op, ClientID: args.ClientID, SeqNo: args.SeqNo}
 	index, term, _ := kv.rf.Start(cmd)
@@ -160,7 +152,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 		// lose leadership
 		curTerm, isLeader := kv.rf.GetState()
-		// TODO: what if still leader, but different term?
+		// TODO: what if still leader, but different term? it means it's replaced by other client's cmd?
 		if !isLeader || term != curTerm {
 			reply.WrongLeader = true
 			reply.Err = ""
@@ -185,25 +177,22 @@ func (kv *RaftKV) applyDaemon() {
 				kv.mu.Lock()
 				switch cmd.Op {
 				case "Get":
-					kv.duplicate[cmd.ClientID] = &LastReply{
-						seq: cmd.SeqNo,
-						reply: &GetReply{
-							WrongLeader: false,
-							Err:         OK,
-							Value:       kv.db[cmd.Key],
-						},
+					dup, ok := kv.duplicate[cmd.ClientID]
+					if !ok || dup.seq < cmd.SeqNo {
+						kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo,
+							reply: &GetReply{Value: kv.db[cmd.Key],}}
 					}
 				case "Put":
-					kv.db[cmd.Key] = cmd.Value
-					kv.duplicate[cmd.ClientID] = &LastReply{
-						seq:   cmd.SeqNo,
-						reply: nil,
+					dup, ok := kv.duplicate[cmd.ClientID]
+					if !ok || dup.seq < cmd.SeqNo {
+						kv.db[cmd.Key] = cmd.Value
+						kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo, reply: nil}
 					}
 				case "Append":
-					kv.db[cmd.Key] += cmd.Value
-					kv.duplicate[cmd.ClientID] = &LastReply{
-						seq:   cmd.SeqNo,
-						reply: nil,
+					dup, ok := kv.duplicate[cmd.ClientID]
+					if !ok || dup.seq < cmd.SeqNo {
+						kv.db[cmd.Key] += cmd.Value
+						kv.duplicate[cmd.ClientID] = &LatestReply{seq: cmd.SeqNo, reply: nil}
 					}
 				default:
 					DPrintf("[%d]: server %d receive invalid cmd: %v\n", kv.me, kv.me, cmd)
@@ -273,7 +262,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.shutdownCh = make(chan struct{})
 
 	// duplication detection table: client->seq no.-> reply
-	kv.duplicate = make(map[int64]*LastReply)
+	kv.duplicate = make(map[int64]*LatestReply)
 
 	go kv.applyDaemon()
 

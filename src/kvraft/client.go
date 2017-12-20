@@ -71,24 +71,22 @@ func (ck *Clerk) Get(key string) string {
 		reply := new(GetReply)
 
 		ck.leader %= cnt
-		// rpc timeout: 1s
-		timeout := time.NewTimer(1000 * time.Millisecond)
 		done := make(chan bool, 1)
 		go func() {
 			ok := ck.servers[ck.leader].Call("RaftKV.Get", args, reply)
 			done <- ok
 		}()
 		select {
-		case <-timeout.C:
+		case <-time.After(200 * time.Millisecond): // rpc timeout: 200ms
 			ck.leader++
 			continue
 		case ok := <-done:
-			if !timeout.Stop() {
-				<-timeout.C
-			}
 			if ok && !reply.WrongLeader {
 				ck.seq++
-				return reply.Value
+				if reply.Err == OK {
+					return reply.Value
+				}
+				return ""
 			}
 			ck.leader++
 		}
@@ -113,24 +111,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		args := &PutAppendArgs{Key: key, Value: value, Op: op, ClientID: ck.id, SeqNo: ck.seq}
 		reply := new(PutAppendReply)
-		ck.leader %= cnt
 
-		// rpc timeout: 1s
-		timeout := time.NewTimer(1000 * time.Millisecond)
+		ck.leader %= cnt
 		done := make(chan bool, 1)
 		go func() {
 			ok := ck.servers[ck.leader].Call("RaftKV.PutAppend", args, reply)
 			done <- ok
 		}()
-
 		select {
-		case <-timeout.C:
+		case <-time.After(200 * time.Millisecond): // rpc timeout: 200ms
 			ck.leader++
 			continue
 		case ok := <-done:
-			if !timeout.Stop() {
-				<-timeout.C
-			}
 			if ok && !reply.WrongLeader && reply.Err == OK {
 				ck.seq++
 				return
