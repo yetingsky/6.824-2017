@@ -33,6 +33,13 @@ var rng = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
 var mu sync.Mutex
 var timeout = make(map[time.Duration]bool)
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -544,15 +551,8 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 					} else {
 						rf.nextIndex[n] = reply.FirstIndex
 					}
-
-					// rf.nextIndex[n] may be 0, because of unstable net, when reach 0, reset to 1
-					if rf.nextIndex[n] <= 0 {
-						rf.nextIndex[n] = 1
-					} else if rf.nextIndex[n] > len(rf.Logs) {
-						DPrintf("[%d-%s]: warning: peer %d's match index exceed log(%d-%d) <rpc fail>\n",
-							rf.me, rf, n, rf.nextIndex[n], len(rf.Logs))
-						rf.nextIndex[n] = len(rf.Logs)
-					}
+					// 1<= rf.nextIndex[n] <= len(rf.Logs)
+					rf.nextIndex[n] = min(max(rf.nextIndex[n], 1), len(rf.Logs))
 				}
 				rf.mu.Unlock()
 			}
