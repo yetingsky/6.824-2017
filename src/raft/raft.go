@@ -202,7 +202,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		// if is null (follower) or itself is a candidate (or stale leader) with same term
 		if rf.VotedFor == -1 { //|| (rf.VotedFor == rf.me && !sameTerm) { //|| rf.votedFor == args.CandidateID {
-
 			// check whether candidate's log is at-least-as update
 			if (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIdx) ||
 				args.LastLogTerm > lastLogTerm {
@@ -380,7 +379,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		reply.FirstIndex = first
-
 		if len(rf.Logs) <= args.PrevLogIndex {
 			DPrintf("[%d-%s]: AE failed from leader %d, leader has more logs (%d > %d), reply: %d - %d.\n",
 				rf.me, rf, args.LeaderID, args.PrevLogIndex, len(rf.Logs)-1, reply.ConflictTerm, reply.FirstIndex)
@@ -487,8 +485,6 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 			rf.mu.Unlock()
 
 			// Wait until timeout? Need a way to give up (timeout)
-			// rpc timeout
-			timeout := time.NewTimer(rf.heartbeatInterval / 2)
 			replyCh := make(chan bool, 1)
 			go func() {
 				ok := rf.sendAppendEntries(n, &args, &reply)
@@ -496,13 +492,10 @@ func (rf *Raft) consistencyCheckDaemon(n int) {
 			}()
 
 			select {
-			case <-timeout.C:
+			case <-time.After(rf.heartbeatInterval / 2): // rpc timeout
 				DPrintf("[%d-%s]: AE rpc to peer %d timeout, no valid reply from remote server\n",
 					rf.me, rf, n)
 			case ok := <-replyCh:
-				if !timeout.Stop() {
-					<-timeout.C
-				}
 				if !ok {
 					DPrintf("[%d-%s]: AE rpc to peer %d failed, no valid reply from remote server\n",
 						rf.me, rf, n)
@@ -739,19 +732,15 @@ func (rf *Raft) canvassVotes() {
 				doneCh := make(chan bool, 1)
 
 				// rpc timeout
-				timeout := time.NewTimer(rf.electionTimeout / 2)
 				go func() {
 					ok := rf.sendRequestVote(n, &voteArgs, &reply)
 					doneCh <- ok
 				}()
 
 				select {
-				case <-timeout.C:
+				case <-time.After(rf.electionTimeout / 2):
 					DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d timeout.\n", rf.me, rf, n)
 				case ok := <-doneCh:
-					if !timeout.Stop() {
-						<-timeout.C
-					}
 					if !ok {
 						DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d failed.\n", rf.me, rf, n)
 						return
