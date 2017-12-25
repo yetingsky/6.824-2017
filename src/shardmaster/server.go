@@ -267,8 +267,8 @@ func (sm *ShardMaster) rebalance(config *Config) {
 
 	// compensation for lacking
 	if diff := cnt2 - cnt1; diff > 0 {
-		if len(lacking) == 0 {
-			cnt := diff
+		if len(lacking) < diff {
+			cnt := diff - len(lacking)
 			for k, _ := range config.Groups {
 				if len(reverse[k]) == average {
 					lacking = append(lacking, Status{k, 0})
