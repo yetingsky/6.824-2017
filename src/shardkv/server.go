@@ -59,6 +59,15 @@ type ShardKV struct {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// not leader ?
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		reply.Err = ""
+		return
+	}
+
+	DPrintf("[%d]: leader %d receive rpc: Get(%q).\n", kv.me, kv.me, args.Key)
+
 	// not responsible for key?
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
@@ -67,16 +76,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongGroup
 		return
 	}
-
-	// not leader ?
-	if _, isLeader := kv.rf.GetState(); !isLeader {
-		kv.mu.Unlock()
-		reply.WrongLeader = true
-		reply.Err = ""
-		return
-	}
-
-	DPrintf("[%d]: leader %d receive rpc: Get(%q).\n", kv.me, kv.me, args.Key)
 
 	// duplicate put/append request
 	if dup, ok := kv.duplicate[args.ClientID]; ok {
@@ -126,6 +125,16 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// not leader ?
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		reply.Err = ""
+		return
+	}
+
+	DPrintf("[%d]: leader %d receive rpc: PutAppend(%q => (%q,%q), (%d-%d).\n", kv.me, kv.me,
+		args.Op, args.Key, args.Value, args.ClientID, args.SeqNo)
+
 	// not responsible for key?
 	shard := key2shard(args.Key)
 	kv.mu.Lock()
@@ -134,17 +143,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongGroup
 		return
 	}
-
-	// not leader ?
-	if _, isLeader := kv.rf.GetState(); !isLeader {
-		kv.mu.Unlock()
-		reply.WrongLeader = true
-		reply.Err = ""
-		return
-	}
-
-	DPrintf("[%d]: leader %d receive rpc: PutAppend(%q => (%q,%q), (%d-%d).\n", kv.me, kv.me,
-		args.Op, args.Key, args.Value, args.ClientID, args.SeqNo)
 
 	// duplicate put/append request
 	if dup, ok := kv.duplicate[args.ClientID]; ok {
@@ -306,7 +304,7 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	d.Decode(&kv.duplicate)
 }
 
-// get latest config: query shard master per second
+// get latest config: query shard master per 100ms
 func (kv *ShardKV) getLatestConfig() {
 	for {
 		select {
