@@ -18,20 +18,20 @@ package raft
 //
 
 import (
-	"math/rand"
 	"sync"
 	"labrpc"
 	"time"
 	"bytes"
 	"encoding/gob"
 	"sort"
+	"math/rand"
 )
 
-var rng = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
-
-// filter out too close timeout
-var mu sync.Mutex
-var timeout = make(map[time.Duration]bool)
+//var rng = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
+//
+//// filter out too close timeout
+//var mu sync.Mutex
+//var timeout = make(map[time.Duration]bool)
 
 func max(a, b int) int {
 	if a > b {
@@ -754,10 +754,6 @@ func (rf *Raft) updateCommitIndex() {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
-	mu.Lock()
-	delete(timeout, rf.electionTimeout)
-	mu.Unlock()
-
 	close(rf.shutdownCh)
 	rf.commitCond.Broadcast()
 }
@@ -802,68 +798,45 @@ func (rf *Raft) applyLogEntryDaemon() {
 }
 
 // canvassVotes issues RequestVote RPC
+// TODO: what's the difference between 1 and 2? no difference
 func (rf *Raft) canvassVotes() {
 	var voteArgs RequestVoteArgs
 	rf.fillRequestVoteArgs(&voteArgs)
 	peers := len(rf.peers)
 
-	// buffered channel, avoid goroutine leak
-	replyCh := make(chan RequestVoteReply, peers)
-
-	var wg sync.WaitGroup
-	for i := 0; i < peers; i++ {
-		if i != rf.me {
-			wg.Add(1)
-			go func(n int) {
-				defer wg.Done()
-				var reply RequestVoteReply
-				doneCh := make(chan bool, 1)
-
-				go func() {
-					ok := rf.sendRequestVote(n, &voteArgs, &reply)
-					doneCh <- ok
-				}()
-				select {
-				case <-time.After(rf.electionTimeout / 2):
-					DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d timeout.\n", rf.me, rf, n)
-				case ok := <-doneCh:
-					if !ok {
-						DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d failed.\n", rf.me, rf, n)
-						return
-					}
-					replyCh <- reply
-				}
-			}(i)
-		}
-	}
-	// closer, in case
-	go func() { wg.Wait(); close(replyCh) }()
-
 	var votes = 1
-	for reply := range replyCh {
+	replyHandler := func(reply *RequestVoteReply) {
 		rf.mu.Lock()
+		defer rf.mu.Unlock()
 		if rf.state == Candidate {
 			if reply.CurrentTerm > voteArgs.Term {
 				rf.CurrentTerm = reply.CurrentTerm
 				rf.turnToFollow()
 				rf.persist()
-				rf.mu.Unlock()
 				rf.resetTimer <- struct{}{} // reset timer
 				return
 			}
-			if reply.VoteGranted == true {
-				if votes++; votes > peers/2 {
+			if reply.VoteGranted {
+				if votes == peers/2 {
 					rf.state = Leader
-					rf.resetOnElection() // reset leader state
-					rf.mu.Unlock()
-
+					rf.resetOnElection()    // reset leader state
 					go rf.heartbeatDaemon() // new leader, start heartbeat daemon
-					DPrintf("[%d-%s]: peer %d become new leader\n", rf.me, rf, rf.me)
+					DPrintf("[%d-%s]: peer %d become new leader.\n", rf.me, rf, rf.me)
 					return
 				}
+				votes++
 			}
 		}
-		rf.mu.Unlock()
+	}
+	for i := 0; i < peers; i++ {
+		if i != rf.me {
+			go func(n int) {
+				var reply RequestVoteReply
+				if rf.sendRequestVote(n, &voteArgs, &reply) {
+					replyHandler(&reply)
+				}
+			}(i)
+		}
 	}
 }
 
@@ -907,10 +880,8 @@ func (rf *Raft) electionDaemon() {
 			}
 			rf.electionTimer.Reset(rf.electionTimeout)
 		case <-rf.electionTimer.C:
-			rf.mu.Lock()
 			DPrintf("[%d-%s]: peer %d election timeout, issue election @ term %d\n",
 				rf.me, rf, rf.me, rf.CurrentTerm)
-			rf.mu.Unlock()
 			go rf.canvassVotes()
 			rf.electionTimer.Reset(rf.electionTimeout)
 		}
@@ -918,26 +889,26 @@ func (rf *Raft) electionDaemon() {
 }
 
 // generate election time: 20ms interval
-func generateElectionTimeout(n int) time.Duration {
-	mu.Lock()
-	defer mu.Unlock()
-	var res = 400*time.Millisecond + time.Duration(n+20)*time.Millisecond
-	for {
-		var ok = true
-		res = time.Millisecond * (400 + time.Duration(rng.Intn(100)*4))
-		for j := -10; j < 10; j++ {
-			if timeout[res+time.Duration(j)*time.Millisecond] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			timeout[res] = true
-			return res
-		}
-	}
-	return res
-}
+//func generateElectionTimeout(n int) time.Duration {
+//	mu.Lock()
+//	defer mu.Unlock()
+//	var res = 400*time.Millisecond + time.Duration(n+20)*time.Millisecond
+//	for {
+//		var ok = true
+//		res = time.Millisecond * (400 + time.Duration(rng.Intn(100)*4))
+//		for j := -10; j < 10; j++ {
+//			if timeout[res+time.Duration(j)*time.Millisecond] {
+//				ok = false
+//				break
+//			}
+//		}
+//		if ok {
+//			timeout[res] = true
+//			return res
+//		}
+//	}
+//	return res
+//}
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -969,10 +940,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
-	rf.shutdownCh = make(chan struct{})              // shutdown raft gracefully
-	rf.electionTimeout = generateElectionTimeout(me) // 400~800 ms, 20 ms interval
+	// 400~800 ms
+	rf.electionTimeout = time.Millisecond * time.Duration(400+rand.Intn(100)*4)
+
 	rf.electionTimer = time.NewTimer(rf.electionTimeout)
 	rf.resetTimer = make(chan struct{})
+	rf.shutdownCh = make(chan struct{})          // shutdown raft gracefully
 	rf.commitCond = sync.NewCond(&rf.mu)         // commitCh, a distinct goroutine
 	rf.heartbeatInterval = time.Millisecond * 40 // small enough, not to small
 
