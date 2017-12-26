@@ -708,18 +708,19 @@ func (rf *Raft) heartbeatDaemon() {
 			return
 		}
 		// reset leader's election timer
-		for i := 0; i < len(rf.peers); i++ {
-			if i != rf.me {
-				go rf.consistencyCheck(i) // routine heartbeat
-			}
-		}
-		time.Sleep(rf.heartbeatInterval)
 		rf.resetTimer <- struct{}{}
+
 		select {
 		case <-rf.shutdownCh:
 			return
 		default:
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					go rf.consistencyCheck(i) // routine heartbeat
+				}
+			}
 		}
+		time.Sleep(rf.heartbeatInterval)
 	}
 }
 
@@ -802,44 +803,79 @@ func (rf *Raft) applyLogEntryDaemon() {
 
 // canvassVotes issues RequestVote RPC
 func (rf *Raft) canvassVotes() {
+	select {
+	case <-rf.shutdownCh:
+		DPrintf("[%d-%s]: peer %d is shutting down canvass votes routine.\n", rf.me, rf, rf.me)
+		return
+	default:
+	}
+
 	var voteArgs RequestVoteArgs
 	rf.fillRequestVoteArgs(&voteArgs)
 	peers := len(rf.peers)
 
-	var votes = 1
-	replyHandler := func(reply *RequestVoteReply) {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if rf.state == Candidate {
-			if reply.CurrentTerm > voteArgs.Term {
-				rf.CurrentTerm = reply.CurrentTerm
-				rf.turnToFollow()
-				rf.persist()
-				// reset timer
-				rf.resetTimer <- struct{}{}
-				return
-			}
-			if reply.VoteGranted {
-				if votes == peers/2 {
-					DPrintf("[%d-%s]: peer %d become new leader.\n", rf.me, rf, rf.me)
-					rf.state = Leader
-					// reset leader state
-					rf.resetOnElection()
-					// new leader, start heartbeat daemon
-					go rf.heartbeatDaemon()
-				}
-				votes++
-			}
-		}
-	}
+	// buffered channel, avoid goroutine leak
+	replyCh := make(chan RequestVoteReply, peers)
+
+	var wg sync.WaitGroup
 	for i := 0; i < peers; i++ {
-		if i != rf.me {
+		if i == rf.me {
+			// reset itself's electionTimer
+			rf.resetTimer <- struct{}{}
+		} else {
+			wg.Add(1)
 			go func(n int) {
+				defer wg.Done()
 				var reply RequestVoteReply
-				if ok := rf.sendRequestVote(n, &voteArgs, &reply); ok {
-					replyHandler(&reply)
+				doneCh := make(chan bool, 1)
+
+				go func() {
+					ok := rf.sendRequestVote(n, &voteArgs, &reply)
+					doneCh <- ok
+				}()
+				select {
+				case <-time.After(rf.electionTimeout / 2):
+					DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d timeout.\n", rf.me, rf, n)
+				case ok := <-doneCh:
+					if !ok {
+						DPrintf("[%d-%s]: canvassVotes() request rv rpc to peer %d failed.\n", rf.me, rf, n)
+						return
+					}
+					replyCh <- reply
 				}
 			}(i)
+		}
+	}
+	// closer, in case
+	go func() { wg.Wait(); close(replyCh) }()
+
+	var votes = 1
+	for reply := range replyCh {
+		if reply.VoteGranted == true {
+			if votes++; votes > peers/2 {
+				rf.mu.Lock()
+				rf.state = Leader
+				rf.mu.Unlock()
+
+				DPrintf("[%d-%s]: peer %d become new leader\n", rf.me, rf, rf.me)
+
+				// reset leader state
+				rf.resetOnElection()
+
+				// new leader, start heartbeat daemon
+				go rf.heartbeatDaemon()
+				return
+			}
+		} else if reply.CurrentTerm > voteArgs.Term {
+			rf.mu.Lock()
+			rf.CurrentTerm = reply.CurrentTerm
+			rf.turnToFollow()
+			rf.persist()
+			rf.mu.Unlock()
+
+			// reset timer
+			rf.resetTimer <- struct{}{}
+			return
 		}
 	}
 }
