@@ -803,13 +803,6 @@ func (rf *Raft) applyLogEntryDaemon() {
 
 // canvassVotes issues RequestVote RPC
 func (rf *Raft) canvassVotes() {
-	select {
-	case <-rf.shutdownCh:
-		DPrintf("[%d-%s]: peer %d is shutting down canvass votes routine.\n", rf.me, rf, rf.me)
-		return
-	default:
-	}
-
 	var voteArgs RequestVoteArgs
 	rf.fillRequestVoteArgs(&voteArgs)
 	peers := len(rf.peers)
@@ -819,10 +812,7 @@ func (rf *Raft) canvassVotes() {
 
 	var wg sync.WaitGroup
 	for i := 0; i < peers; i++ {
-		if i == rf.me {
-			// reset itself's electionTimer
-			rf.resetTimer <- struct{}{}
-		} else {
+		if i != rf.me {
 			wg.Add(1)
 			go func(n int) {
 				defer wg.Done()
@@ -851,32 +841,29 @@ func (rf *Raft) canvassVotes() {
 
 	var votes = 1
 	for reply := range replyCh {
-		if reply.VoteGranted == true {
-			if votes++; votes > peers/2 {
-				rf.mu.Lock()
-				rf.state = Leader
+		rf.mu.Lock()
+		if rf.state == Candidate {
+			if reply.CurrentTerm > voteArgs.Term {
+				rf.CurrentTerm = reply.CurrentTerm
+				rf.turnToFollow()
+				rf.persist()
 				rf.mu.Unlock()
-
-				DPrintf("[%d-%s]: peer %d become new leader\n", rf.me, rf, rf.me)
-
-				// reset leader state
-				rf.resetOnElection()
-
-				// new leader, start heartbeat daemon
-				go rf.heartbeatDaemon()
+				rf.resetTimer <- struct{}{} // reset timer
 				return
 			}
-		} else if reply.CurrentTerm > voteArgs.Term {
-			rf.mu.Lock()
-			rf.CurrentTerm = reply.CurrentTerm
-			rf.turnToFollow()
-			rf.persist()
-			rf.mu.Unlock()
+			if reply.VoteGranted == true {
+				if votes++; votes > peers/2 {
+					rf.state = Leader
+					rf.resetOnElection() // reset leader state
+					rf.mu.Unlock()
 
-			// reset timer
-			rf.resetTimer <- struct{}{}
-			return
+					go rf.heartbeatDaemon() // new leader, start heartbeat daemon
+					DPrintf("[%d-%s]: peer %d become new leader\n", rf.me, rf, rf.me)
+					return
+				}
+			}
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -986,8 +973,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimeout = generateElectionTimeout(me) // 400~800 ms, 20 ms interval
 	rf.electionTimer = time.NewTimer(rf.electionTimeout)
 	rf.resetTimer = make(chan struct{})
-	rf.commitCond = sync.NewCond(&rf.mu)          // commitCh, a distinct goroutine
-	rf.heartbeatInterval = time.Millisecond * 100 // 100ms
+	rf.commitCond = sync.NewCond(&rf.mu)         // commitCh, a distinct goroutine
+	rf.heartbeatInterval = time.Millisecond * 40 // small enough, not to small
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
