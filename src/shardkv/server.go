@@ -66,7 +66,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	DPrintf("[%d]: leader %d receive rpc: Get(%q).\n", kv.me, kv.me, args.Key)
+	DPrintf("[%d-%d]: leader %d receive rpc: Get(%q).\n", kv.gid, kv.me, kv.me, args.Key)
 
 	// not responsible for key?
 	kv.mu.Lock()
@@ -132,7 +132,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	DPrintf("[%d]: leader %d receive rpc: PutAppend(%q => (%q,%q), (%d-%d).\n", kv.me, kv.me,
+	DPrintf("[%d-%d]: leader %d receive rpc: PutAppend(%q => (%q,%q), (%d-%d).\n", kv.gid, kv.me, kv.me,
 		args.Op, args.Key, args.Value, args.ClientID, args.SeqNo)
 
 	// not responsible for key?
@@ -198,7 +198,7 @@ func (kv *ShardKV) applyDaemon() {
 	for {
 		select {
 		case <-kv.shutdownCh:
-			DPrintf("[%d]: server %d is shutting down.\n", kv.me, kv.me)
+			DPrintf("[%d-%d]: server %d is shutting down.\n", kv.gid, kv.me, kv.me)
 			return
 		case msg, ok := <-kv.applyCh:
 			if ok {
@@ -228,20 +228,20 @@ func (kv *ShardKV) applyDaemon() {
 							kv.db[cmd.Key] += cmd.Value
 							kv.duplicate[cmd.ClientID] = &LatestReply{Seq: cmd.SeqNo,}
 						default:
-							DPrintf("[%d]: server %d receive invalid cmd: %v\n", kv.me, kv.me, cmd)
+							DPrintf("[%d-%d]: server %d receive invalid cmd: %v\n", kv.gid, kv.me, kv.me, cmd)
 							panic("invalid command operation")
 						}
 						if ok {
-							DPrintf("[%d]: server %d apply index: %d, cmd: %v (client: %d, dup seq: %d < %d)\n",
-								kv.me, kv.me, msg.Index, cmd, cmd.ClientID, dup.Seq, cmd.SeqNo)
+							DPrintf("[%d-%d]: server %d apply index: %d, cmd: %v (client: %d, dup seq: %d < %d)\n",
+								kv.gid, kv.me, kv.me, msg.Index, cmd, cmd.ClientID, dup.Seq, cmd.SeqNo)
 						}
 					}
 
 					// snapshot detection: up through msg.Index
 					if needSnapshot(kv) {
 						// save snapshot and notify raft
-						DPrintf("[%d]: server %d need generate snapshot @ %d (%d vs %d), client: %d.\n",
-							kv.me, kv.me, msg.Index, kv.maxraftstate, kv.persist.RaftStateSize(), cmd.ClientID)
+						DPrintf("[%d-%d]: server %d need generate snapshot @ %d (%d vs %d), client: %d.\n",
+							kv.gid, kv.me, kv.me, msg.Index, kv.maxraftstate, kv.persist.RaftStateSize(), cmd.ClientID)
 						kv.generateSnapshot(msg.Index)
 						kv.rf.NewSnapShot(msg.Index)
 					}
@@ -379,5 +379,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// long-running work
 	go kv.applyDaemon()     // get log entry from raft layer
 	go kv.getLatestConfig() // query shard master for configuration
+
+	DPrintf("StartServer: %d-%d\n", kv.gid, kv.me)
+
 	return kv
 }
