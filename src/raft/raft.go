@@ -987,7 +987,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer = time.NewTimer(rf.electionTimeout)
 	rf.resetTimer = make(chan struct{})
 	rf.commitCond = sync.NewCond(&rf.mu)          // commitCh, a distinct goroutine
-	rf.heartbeatInterval = time.Millisecond * 200 // 200ms
+	rf.heartbeatInterval = time.Millisecond * 100 // 100ms
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
