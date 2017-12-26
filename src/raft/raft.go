@@ -85,7 +85,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	//isLeader          bool
 	state             int           // follower, candidate or leader
-	resetTimer        chan struct{} // for reset election timer
+	resetTimerCh      chan struct{} // for reset election timer
 	electionTimer     *time.Timer   // election timer
 	electionTimeout   time.Duration // 400~800ms
 	heartbeatInterval time.Duration // 100ms
@@ -257,7 +257,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIdx) ||
 				args.LastLogTerm > lastLogTerm {
 
-				rf.resetTimer <- struct{}{}
+				rf.resetTimerCh <- struct{}{}
 
 				rf.state = Follower
 				rf.VotedFor = args.CandidateID
@@ -364,7 +364,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// valid AE, reset election timer
-	rf.resetTimer <- struct{}{}
+	rf.resetTimerCh <- struct{}{}
 
 	// if receive past heartbeat, return false
 	if args.PrevLogIndex < rf.snapshotIndex {
@@ -493,7 +493,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	rf.resetTimer <- struct{}{}
+	rf.resetTimerCh <- struct{}{}
 
 	// snapshot have all logs
 	if args.LastIncludedIndex >= rf.snapshotIndex+len(rf.Logs)-1 {
@@ -593,7 +593,7 @@ func (rf *Raft) consistencyCheckReplyHandler(n int, reply *AppendEntriesReply) {
 		if rf.state == Leader && reply.CurrentTerm > rf.CurrentTerm {
 			rf.turnToFollow()
 			rf.persist()
-			rf.resetTimer <- struct{}{}
+			rf.resetTimerCh <- struct{}{}
 			DPrintf("[%d-%s]: leader %d found new term (heartbeat resp from peer %d), turn to follower.",
 				rf.me, rf, rf.me, n)
 			return
@@ -704,21 +704,20 @@ func (rf *Raft) sendSnapshot(server int) {
 // Only leader can issue heartbeat message.
 func (rf *Raft) heartbeatDaemon() {
 	for {
-		if _, isLeader := rf.GetState(); !isLeader {
-			return
-		}
-		// reset leader's election timer
-		for i := 0; i < len(rf.peers); i++ {
-			if i != rf.me {
-				go rf.consistencyCheck(i) // routine heartbeat
+		if _, isLeader := rf.GetState(); isLeader {
+			// reset leader's election timer
+			rf.resetTimerCh <- struct{}{}
+			select {
+			case <-rf.shutdownCh:
+				return
+			default:
+				for i := 0; i < len(rf.peers); i++ {
+					if i != rf.me {
+						go rf.consistencyCheck(i) // routine heartbeat
+					}
+				}
 			}
-		}
-		time.Sleep(rf.heartbeatInterval)
-		rf.resetTimer <- struct{}{}
-		select {
-		case <-rf.shutdownCh:
-			return
-		default:
+			time.Sleep(rf.heartbeatInterval)
 		}
 	}
 }
@@ -816,7 +815,7 @@ func (rf *Raft) canvassVotes() {
 				rf.turnToFollow()
 				rf.persist()
 				// reset timer
-				rf.resetTimer <- struct{}{}
+				rf.resetTimerCh <- struct{}{}
 				return
 			}
 			if reply.VoteGranted {
@@ -878,7 +877,7 @@ func (rf *Raft) electionDaemon() {
 		case <-rf.shutdownCh:
 			DPrintf("[%d-%s]: peer %d is shutting down electionDaemon.\n", rf.me, rf, rf.me)
 			return
-		case <-rf.resetTimer:
+		case <-rf.resetTimerCh:
 			if !rf.electionTimer.Stop() {
 				<-rf.electionTimer.C
 			}
@@ -949,9 +948,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.shutdownCh = make(chan struct{})              // shutdown raft gracefully
 	rf.electionTimeout = generateElectionTimeout(me) // 400~800 ms, 20 ms interval
 	rf.electionTimer = time.NewTimer(rf.electionTimeout)
-	rf.resetTimer = make(chan struct{})
+
+	rf.resetTimerCh = make(chan struct{})
 	rf.commitCond = sync.NewCond(&rf.mu)          // commitCh, a distinct goroutine
-	rf.heartbeatInterval = time.Millisecond * 200 // 200ms
+	rf.heartbeatInterval = time.Millisecond * 100 // 100ms
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
