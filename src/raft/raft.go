@@ -27,12 +27,6 @@ import (
 	"math/rand"
 )
 
-//var rng = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
-//
-//// filter out too close timeout
-//var mu sync.Mutex
-//var timeout = make(map[time.Duration]bool)
-
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -924,7 +918,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetTimer = make(chan struct{})
 	rf.shutdownCh = make(chan struct{})          // shutdown raft gracefully
 	rf.commitCond = sync.NewCond(&rf.mu)         // commitCh, a distinct goroutine
-	rf.heartbeatInterval = time.Millisecond * 40 // small enough, not to small
+	rf.heartbeatInterval = time.Millisecond * 40 // small enough, not too small
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
