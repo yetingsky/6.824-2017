@@ -4,10 +4,10 @@ Awesome Labs.
 
 https://pdos.csail.mit.edu/6.824/index.html
 
-Lab 1: MapReduce: done
+- [x] Lab 1: MapReduce
 
-Lab 2: Raft: done
+- [x] Lab 2: Raft
 
-Lab 3: Fault-tolerant Key/Value Service: done
+- [x] Lab 3: Fault-tolerant Key/Value Service
 
-Lab 4: Sharded Key/Value Service: work in progress
+- [ ] Lab 4: Sharded Key/Value Service (Part A done)
