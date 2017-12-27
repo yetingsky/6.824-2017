@@ -47,3 +47,17 @@ type GetReply struct {
 	Err         Err
 	Value       string
 }
+
+type MigrateArgs struct {
+	Num   int // sequence no
+	Shard int
+	Gid   int
+	Data  map[string]string
+	Dup   map[int64]*LatestReply
+}
+
+type MigrateReply struct {
+	WrongLeader bool
+	Err         Err
+	Shard       int
+}
