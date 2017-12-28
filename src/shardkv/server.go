@@ -64,19 +64,19 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	mck           *shardmaster.Clerk    // talk to master
-	persist       *raft.Persister       // store snapshot
-	shutdownCh    chan struct{}         // shutdown gracefully
-	db            DataBase              // data store
-	notifyChs     map[int]chan struct{} // per log entry
-	duplicate     Duplicate             // duplication detection table
-	snapshotIndex int                   // snapshot
-	configs       []shardmaster.Config  // 0 is always the current configuration
-	workList      map[int]MigrateWork   // config No. -> work to be done
+	mck           *shardmaster.Clerk   // talk to master
+	persist       *raft.Persister      // store snapshot
+	shutdownCh    chan struct{}        // shutdown gracefully
+	db            DataBase             // data store
+	notifyChs     map[int]chan Err     // per log entry
+	duplicate     Duplicate            // duplication detection table
+	snapshotIndex int                  // snapshot
+	configs       []shardmaster.Config // configs[0] is current configuration
+	workList      map[int]MigrateWork  // config No. -> work to be done
 }
 
 type MigrateWork struct {
-	sendTo, recFrom []Item
+	recFrom []Item
 }
 type Item struct {
 	shard, gid int
@@ -111,6 +111,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			if shard == item.shard {
 				kv.mu.Unlock()
 				reply.Err = ErrWrongGroup
+				DPrintf("[%d-%d]: postpone client request, still waiting data.\n", kv.gid, kv.me)
 				return
 			}
 		}
@@ -124,6 +125,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			reply.WrongLeader = false
 			reply.Err = OK
 			reply.Value = dup.Reply.Value
+			DPrintf("[%d-%d]: duplicate request: %d - %d.\n", kv.gid, kv.me, args.SeqNo, dup.Seq)
 			return
 		}
 	}
@@ -131,7 +133,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	cmd := Op{Key: args.Key, Op: "Get", ClientID: args.ClientID, SeqNo: args.SeqNo}
 	index, term, _ := kv.rf.Start(cmd)
 
-	ch := make(chan struct{})
+	ch := make(chan Err)
 	kv.notifyChs[index] = ch
 	kv.mu.Unlock()
 
@@ -140,7 +142,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	// wait for Raft to complete agreement
 	select {
-	case <-ch:
+	case err := <-ch:
 		// lose leadership
 		curTerm, isLeader := kv.rf.GetState()
 		// what if still leader, but different term? let client retry
@@ -150,13 +152,16 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 
-		kv.mu.Lock()
-		if value, ok := kv.db[args.Key]; ok {
-			reply.Value = value
-		} else {
-			reply.Err = ErrNoKey
+		reply.Err = err
+		if err == OK {
+			kv.mu.Lock()
+			if value, ok := kv.db[args.Key]; ok {
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+			}
+			kv.mu.Unlock()
 		}
-		kv.mu.Unlock()
 	case <-kv.shutdownCh:
 		return
 	}
@@ -197,7 +202,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			}
 		}
 	}
-
 	// duplicate put/append request
 	if dup, ok := kv.duplicate[args.ClientID]; ok {
 		// filter duplicate
@@ -205,6 +209,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			kv.mu.Unlock()
 			reply.WrongLeader = false
 			reply.Err = OK
+			DPrintf("[%d-%d]: duplicate request: %d - %d.\n", kv.gid, kv.me, args.SeqNo, dup.Seq)
 			return
 		}
 	}
@@ -212,7 +217,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// new request
 	cmd := Op{Key: args.Key, Value: args.Value, Op: args.Op, ClientID: args.ClientID, SeqNo: args.SeqNo}
 	index, term, _ := kv.rf.Start(cmd)
-	ch := make(chan struct{})
+	ch := make(chan Err)
 	kv.notifyChs[index] = ch
 	kv.mu.Unlock()
 
@@ -221,7 +226,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// wait for Raft to complete agreement
 	select {
-	case <-ch:
+	case err := <-ch:
 		// lose leadership
 		curTerm, isLeader := kv.rf.GetState()
 		if !isLeader || term != curTerm {
@@ -229,6 +234,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ""
 			return
 		}
+		reply.Err = err
 	case <-kv.shutdownCh:
 		return
 	}
@@ -243,43 +249,24 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 		return
 	}
 
+	DPrintf("[%d-%d]: Migrate, args: %v.\n", kv.gid, kv.me, args)
+
 	// if receive unexpected newer config migrate, postpone?
 	kv.mu.Lock()
-	if args.Num != kv.configs[0].Num {
-		kv.mu.Unlock()
+	defer kv.mu.Unlock()
+
+	if args.Num > kv.configs[0].Num {
 		reply.WrongLeader = true
 		reply.Err = ""
 		return
 	}
-
-	DPrintf("[%d-%d]: leader %d receive rpc: Migrate, Num:%d, Shard: %d.\n", kv.gid, kv.me, kv.me,
-		args.Num, args.Shard)
-
-	// new request
-	mig := Mig{Num: args.Num, Shard: args.Shard, Gid: args.Gid, Data: args.Data, Dup: args.Dup}
-	index, term, _ := kv.rf.Start(mig)
-	ch := make(chan struct{})
-
-	kv.notifyChs[index] = ch
-	kv.mu.Unlock()
+	reply.Data, reply.Dup = kv.copyDataDup()
 
 	reply.WrongLeader = false
-	reply.Shard = args.Shard
 	reply.Err = OK
-
-	// wait for Raft to complete agreement
-	select {
-	case <-ch:
-		// lose leadership
-		curTerm, isLeader := kv.rf.GetState()
-		if !isLeader || term != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ""
-			return
-		}
-	case <-kv.shutdownCh:
-		return
-	}
+	reply.Shard = args.Shard
+	reply.Num = args.Num
+	reply.Gid = kv.gid
 }
 
 // should be called when holding the lock
@@ -301,7 +288,8 @@ func (kv *ShardKV) applyMigratedData(mig Mig) {
 			kv.duplicate[client] = dup
 		}
 	}
-	// update workList
+
+	// update work list
 	if work, ok := kv.workList[mig.Num]; ok {
 		recFrom := work.recFrom
 		var done = -1
@@ -315,17 +303,17 @@ func (kv *ShardKV) applyMigratedData(mig Mig) {
 			tmp := recFrom[done+1:]
 			recFrom = recFrom[:done]
 			recFrom = append(recFrom, tmp...)
-			// update
-			kv.workList[mig.Num] = MigrateWork{kv.workList[mig.Num].sendTo, recFrom}
 
-			// if done, remove entry
-			if len(kv.workList[mig.Num].sendTo) == 0 &&
-				len(kv.workList[mig.Num].recFrom) == 0 {
+			// done
+			if len(recFrom) == 0 {
 				delete(kv.workList, mig.Num)
+				return
 			}
+			// update
+			kv.workList[mig.Num] = MigrateWork{recFrom}
 		}
 	}
-	DPrintf("[%d-%d]: server %d, applyMigrateData: %v\n", kv.gid, kv.me, kv.me, kv.db)
+	DPrintf("[%d-%d]: server %d, applyMigrateData: dp: %v\n", kv.gid, kv.me, kv.me, kv.db)
 }
 
 //
@@ -358,9 +346,18 @@ func (kv *ShardKV) applyDaemon() {
 				}
 				// have client's request? must filter duplicate command
 				if msg.Command != nil && msg.Index > kv.snapshotIndex {
+					var err Err = OK
 					kv.mu.Lock()
 					switch cmd := msg.Command.(type) {
 					case Op:
+						// switch to new config already?
+						shard := key2shard(cmd.Key)
+						if kv.configs[0].Shards[shard] != kv.gid {
+							//DPrintf("[%d-%d]: group %d switch to new config %d, no responsibility for shard %d\n",
+							//	kv.gid, kv.me, kv.gid, kv.configs[0].Num, shard)
+							err = ErrWrongGroup
+							break
+						}
 						if dup, ok := kv.duplicate[cmd.ClientID]; !ok || dup.Seq < cmd.SeqNo {
 							switch cmd.Op {
 							case "Get":
@@ -385,10 +382,9 @@ func (kv *ShardKV) applyDaemon() {
 						}
 					case Cfg:
 						// duplicate detection: newer than current config
-						// this point
-						kv.switchConfig(cmd.Config)
-						DPrintf("[%d-%d]: server %d switch to new config (%d->%d).\n",
-							kv.gid, kv.me, kv.me, kv.configs[0].Num, cmd.Config.Num)
+						if cmd.Config.Num > kv.configs[0].Num {
+							kv.switchConfig(&cmd.Config)
+						}
 					case Mig:
 						// apply data and dup, then start to accept client requests
 						if cmd.Num == kv.configs[0].Num {
@@ -405,7 +401,7 @@ func (kv *ShardKV) applyDaemon() {
 					}
 					// notify channel
 					if notifyCh, ok := kv.notifyChs[msg.Index]; ok && notifyCh != nil {
-						close(notifyCh)
+						notifyCh <- err
 						delete(kv.notifyChs, msg.Index)
 					}
 					kv.mu.Unlock()
@@ -444,6 +440,7 @@ func (kv *ShardKV) generateSnapshot(index int) {
 	e.Encode(kv.db)
 	e.Encode(kv.snapshotIndex)
 	e.Encode(kv.duplicate)
+	e.Encode(kv.configs)
 
 	data := w.Bytes()
 	kv.persist.SaveSnapshot(data)
@@ -462,32 +459,47 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	d.Decode(&kv.db)
 	d.Decode(&kv.snapshotIndex)
 	d.Decode(&kv.duplicate)
+	d.Decode(&kv.configs)
 }
 
 // should be called when holding the lock
-func (kv *ShardKV) switchConfig(new shardmaster.Config) {
-	// for leader
-	if _, isLeader := kv.rf.GetState(); isLeader && new.Num == kv.configs[0].Num {
-		if work, ok := kv.workList[new.Num]; ok && len(work.sendTo) > 0 {
-			// safe point to copy data and dup
-			db, dup := kv.copyDataDup()
-			go kv.sendShards(new, db, dup)
+// all server in a replica group switch to new config at the same point
+func (kv *ShardKV) switchConfig(new *shardmaster.Config) {
+	DPrintf("[%d-%d]: server %d switch to new config (%d->%d).\n", kv.gid, kv.me, kv.me,
+		kv.configs[0].Num, new.Num)
+
+	var old = &kv.configs[0]
+	// for all server: switch to new config
+	if len(kv.configs) == 1 {
+		kv.configs[0] = *new
+		DPrintf("[%d-%d]: config from leader.\n", kv.gid, kv.me)
+	} else {
+		if kv.configs[1].Num != new.Num {
+			DPrintf("[%d-%d]: server %d have missing or extra configs: %v, %v.\n", kv.gid, kv.me, kv.me,
+				kv.configs, new)
+			if kv.configs[1].Num > new.Num {
+				// missing some configs
+				var newConfigs = make([]shardmaster.Config, 0, len(kv.configs))
+				newConfigs = append(newConfigs, *new)
+				newConfigs = append(newConfigs, kv.configs[1:]...)
+				kv.configs = newConfigs
+			} else {
+				// have extra configs
+				kv.configs[1] = *new
+			}
 		}
-		return
+		kv.configs = kv.configs[1:]
+		DPrintf("[%d-%d]: config from master.\n", kv.gid, kv.me)
 	}
 
-	// for follower, switch to new config
-	if new.Num > kv.configs[0].Num {
-		if len(kv.configs) == 1 {
-			kv.configs[0] = new
-			DPrintf("[%d-%d]: config from leader.\n", kv.gid, kv.me)
-		} else {
-			if kv.configs[1].Num != new.Num {
-				panic("possibly have missing configs")
-			}
-			kv.configs = kv.configs[1:]
-			DPrintf("[%d-%d]: config from master.\n", kv.gid, kv.me)
+	// for leader
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		kv.generateWorkList(old, new)
+		if work, ok := kv.workList[new.Num]; ok && len(work.recFrom) > 0 {
+			// safe point to copy data and dup
+			go kv.requestShards(old, new)
 		}
+		return
 	}
 }
 
@@ -506,18 +518,16 @@ func (kv *ShardKV) copyDataDup() (DataBase, Duplicate) {
 }
 
 // using new config's Num as SeqNo.
-func (kv *ShardKV) sendShards(config shardmaster.Config, db DataBase, dup Duplicate) {
+func (kv *ShardKV) requestShards(old, new *shardmaster.Config) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	sendTo := kv.workList[config.Num].sendTo
+	recFrom := kv.workList[new.Num].recFrom
 
 	fillMigrateArgs := func(shard int) *MigrateArgs {
 		return &MigrateArgs{
-			Num:   config.Num,
+			Num:   new.Num,
 			Shard: shard,
 			Gid:   kv.gid,
-			Data:  db,
-			Dup:   dup,
 		}
 	}
 	replyHandler := func(reply *MigrateReply) {
@@ -528,16 +538,17 @@ func (kv *ShardKV) sendShards(config shardmaster.Config, db DataBase, dup Duplic
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
 
-		// delete redundant data
-		for k, _ := range kv.db {
-			if key2shard(k) == reply.Shard {
-				delete(kv.db, k)
-			}
+		// still at config Num?
+		if reply.Num == new.Num {
+			var mig = Mig{Num: reply.Num, Shard: reply.Shard, Gid: reply.Gid, Data: reply.Data, Dup: reply.Dup}
+			kv.rf.Start(mig)
+
+			DPrintf("[%d-%d]: leader %d receive shard: %d, from: %d).\n", kv.gid, kv.me, kv.me,
+				reply.Shard, reply.Gid)
 		}
-		DPrintf("[%d-%d]: server %d delete shard: %d, db: %v\n", kv.gid, kv.me, kv.me, reply.Shard, kv.db)
 	}
 	// act as a normal client
-	for _, task := range sendTo {
+	for _, task := range recFrom {
 		go func(s, g int) {
 			args := fillMigrateArgs(s)
 			for {
@@ -545,7 +556,7 @@ func (kv *ShardKV) sendShards(config shardmaster.Config, db DataBase, dup Duplic
 				if _, isLeader := kv.rf.GetState(); !isLeader {
 					return
 				}
-				if servers, ok := config.Groups[g]; ok {
+				if servers, ok := old.Groups[g]; ok {
 					// try each server for the shard.
 					for si := 0; si < len(servers); si++ {
 						srv := kv.make_end(servers[si])
@@ -562,22 +573,14 @@ func (kv *ShardKV) sendShards(config shardmaster.Config, db DataBase, dup Duplic
 			}
 		}(task.shard, task.gid)
 	}
-	// update work list
-	kv.workList[config.Num] = MigrateWork{nil, kv.workList[config.Num].recFrom}
-
-	// if done, remove entry
-	if len(kv.workList[config.Num].recFrom) == 0 {
-		delete(kv.workList, config.Num)
-	}
 }
 
 // should be called when holding the lock
-func (kv *ShardKV) generateWorkList(old, new shardmaster.Config) {
+func (kv *ShardKV) generateWorkList(old, new *shardmaster.Config) {
 	// 0 is initial state, no need to send any shards
 	if old.Num == 0 {
 		return
 	}
-
 	var os, ns = make(map[int]bool), make(map[int]bool)
 	for s, g := range old.Shards {
 		if g == kv.gid {
@@ -589,18 +592,15 @@ func (kv *ShardKV) generateWorkList(old, new shardmaster.Config) {
 			ns[s] = true
 		}
 	}
-	var sendTo, recFrom []Item
-	for k, _ := range os {
-		if !ns[k] {
-			sendTo = append(sendTo, Item{k, new.Shards[k]})
-		}
-	}
+	var recFrom []Item
 	for k, _ := range ns {
 		if !os[k] {
 			recFrom = append(recFrom, Item{k, old.Shards[k]})
 		}
 	}
-	kv.workList[new.Num] = MigrateWork{sendTo, recFrom}
+	if len(recFrom) != 0 {
+		kv.workList[new.Num] = MigrateWork{recFrom}
+	}
 }
 
 // get latest config: query shard master per 100ms
@@ -611,7 +611,6 @@ func (kv *ShardKV) getLatestConfig() {
 			return
 		default:
 			config := kv.mck.Query(-1)
-			DPrintf("[%d-%d]: server %d detect new config: %d\n", kv.gid, kv.me, kv.me, config.Num)
 
 			// config changed?
 			kv.mu.Lock()
@@ -619,17 +618,12 @@ func (kv *ShardKV) getLatestConfig() {
 			if isConfigChanged(kv.configs[last], config) {
 				kv.configs = append(kv.configs, config)
 			}
-			// need waiting? just try, if failed, another leader will continue
+			// need waiting? just try, if failed, another leader will reply
 			if len(kv.configs) > 1 {
 				if _, isLeader := kv.rf.GetState(); isLeader && kv.isMigrateDone() {
-					old, new := kv.configs[0], kv.configs[1]
-					kv.generateWorkList(old, new)
-
-					// leader will use new config ASAP
-					kv.configs = kv.configs[1:]
-					kv.rf.Start(Cfg{Config: new})
+					kv.rf.Start(Cfg{Config: kv.configs[1]})
 					DPrintf("[%d-%d]: leader %d detect new config (%d->%d).\n", kv.gid, kv.me, kv.me,
-						old.Num, new.Num)
+						kv.configs[0].Num, kv.configs[1].Num)
 				}
 			}
 			kv.mu.Unlock()
@@ -696,7 +690,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persist = persister
 	kv.shutdownCh = make(chan struct{})
 	kv.db = make(DataBase)
-	kv.notifyChs = make(map[int]chan struct{})
+	kv.notifyChs = make(map[int]chan Err)
 	kv.duplicate = make(Duplicate)
 
 	// Use something like this to talk to the shardmaster:
@@ -706,6 +700,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	// read snapshot when start
+	kv.readSnapshot(kv.persist.ReadSnapshot())
 
 	// long-running work
 	go kv.applyDaemon()     // get log entry from raft layer
