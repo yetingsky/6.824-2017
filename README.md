@@ -10,6 +10,8 @@ https://pdos.csail.mit.edu/6.824/index.html
 
 - [x] Lab 3: Fault-tolerant Key/Value Service
 
-- [x] Lab 4: Sharded Key/Value Service (excluding challenge)
+- [x] Lab 4: Sharded Key/Value Service
 
-- [ ] Challenge exercises (work in progress)
+    - [ ] Garbage collection of state
+    
+    - [ ] Client requests during configuration changes
