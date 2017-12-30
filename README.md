@@ -12,6 +12,6 @@ https://pdos.csail.mit.edu/6.824/index.html
 
 - [x] Lab 4: Sharded Key/Value Service
 
-    - [x] Garbage collection of state (can pass challenge 2 too, though haven't working on it)
+    - [x] Garbage collection of state
     
-    - [ ] Client requests during configuration changes
+    - [x] Client requests during configuration changes
