@@ -63,3 +63,15 @@ type MigrateReply struct {
 	Data        map[string]string
 	Dup         map[int64]*LatestReply
 }
+
+// garbage collection
+type CleanUpArgs struct {
+	Num   int
+	Shard int
+	Gid   int
+}
+
+type CleanUpReply struct {
+	WrongLeader bool
+	Err         Err
+}

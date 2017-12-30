@@ -48,6 +48,12 @@ type Mig struct {
 	Dup   Duplicate
 }
 
+type CleanUp struct {
+	Num   int
+	Shard int
+	Gid   int
+}
+
 type LatestReply struct {
 	Seq   int      // latest request
 	Reply GetReply // latest reply
@@ -73,11 +79,12 @@ type ShardKV struct {
 	snapshotIndex int                  // snapshot
 	configs       []shardmaster.Config // configs[0] is current configuration
 	workList      map[int]MigrateWork  // config No. -> work to be done
+	gcHistory     map[int]int          // shard->config
 }
 
 type MigrateWork struct {
 	RecFrom []Item
-	Old     shardmaster.Config
+	Last    shardmaster.Config
 }
 type Item struct {
 	Shard, Gid int
@@ -172,6 +179,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	defer func() {
+		DPrintf("[%d-%d]: PutAppend args: %v, reply: %v. (shard: %d)\n", kv.gid, kv.me, args, reply,
+			key2shard(args.Key))
+	}()
+
 	// Your code here.
 	// not leader ?
 	if _, isLeader := kv.rf.GetState(); !isLeader {
@@ -246,6 +258,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 // Migrate Configuration
 func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
+	defer func() {
+		DPrintf("[%d-%d]: request Migrate, args: %v, reply: %t, %q, db: %v.\n", kv.gid, kv.me, args,
+			reply.WrongLeader, reply.Err, reply.Data)
+	}()
+
 	// not leader?
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.WrongLeader = true
@@ -271,8 +288,43 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	reply.Gid = kv.gid
 }
 
+// GC RPC: called by other group to notify cleaning up unnecessary Shards
+func (kv *ShardKV) CleanUp(args *CleanUpArgs, reply *CleanUpReply) {
+	defer func() {
+		DPrintf("[%d-%d]: request CleanUp, args: %v, reply: %v.\n", kv.gid, kv.me, args, reply)
+	}()
+
+	// not leader?
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		reply.Err = ""
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// if receive unexpected newer config cleanup? postpone until itself detect new config
+	if args.Num > kv.configs[0].Num {
+		reply.WrongLeader = true
+		reply.Err = ""
+		return
+	}
+
+	if kv.gcHistory[args.Shard] < args.Num {
+		kv.rf.Start(CleanUp{Num: args.Num, Shard: args.Shard, Gid: args.Gid})
+	}
+
+	reply.WrongLeader = false
+	reply.Err = OK
+}
+
 // should be called when holding the lock
 func (kv *ShardKV) applyMigratedData(mig Mig) {
+	defer func() {
+		DPrintf("[%d-%d]: kv.workList: %v\n", kv.gid, kv.me, kv.workList)
+	}()
+
 	// update data
 	for k, v := range mig.Data {
 		if key2shard(k) == mig.Shard {
@@ -298,6 +350,11 @@ func (kv *ShardKV) applyMigratedData(mig Mig) {
 		for i, item := range recFrom {
 			if item.Shard == mig.Shard && item.Gid == mig.Gid {
 				done = i
+
+				// if leader, it's time to notify original owner to cleanup
+				if _, isLeader := kv.rf.GetState(); isLeader {
+					go kv.requestCleanUp(item.Shard, item.Gid, &work.Last)
+				}
 				break
 			}
 		}
@@ -312,9 +369,21 @@ func (kv *ShardKV) applyMigratedData(mig Mig) {
 				return
 			}
 			// update
-			kv.workList[mig.Num] = MigrateWork{recFrom, kv.workList[mig.Num].Old}
+			kv.workList[mig.Num] = MigrateWork{recFrom, kv.workList[mig.Num].Last}
 		}
 	}
+}
+
+// garbage collection of state when lost ownership
+// should be called when holding the lock
+func (kv *ShardKV) shardGC(args CleanUp) {
+	for k := range kv.db {
+		if shard := key2shard(k); shard == args.Shard {
+			delete(kv.db, k)
+		}
+	}
+	DPrintf("[%d-%d]: server %d has gc shard: %d @ config: %d, from gid: %d\n",
+		kv.gid, kv.me, kv.me, args.Shard, args.Num, args.Gid)
 }
 
 //
@@ -386,6 +455,18 @@ func (kv *ShardKV) applyDaemon() {
 						if cmd.Num == kv.configs[0].Num && !kv.isMigrateDone("applyMigrateData") {
 							kv.applyMigratedData(cmd)
 						}
+					case CleanUp:
+						if kv.gcHistory[cmd.Shard] < cmd.Num && cmd.Num <= kv.configs[0].Num {
+							if kv.configs[0].Shards[cmd.Shard] != kv.gid {
+								kv.shardGC(cmd)
+								kv.gcHistory[cmd.Shard] = cmd.Num
+							} else {
+								kv.gcHistory[cmd.Shard] = kv.configs[0].Num
+							}
+						} else {
+							DPrintf("[%d-%d]: server %d, shard: %d, config: %d - %d, gc history: %d\n",
+								kv.gid, kv.me, kv.me, cmd.Shard, cmd.Num, kv.configs[0].Num, kv.gcHistory[cmd.Shard])
+						}
 					default:
 						panic("Oops... unknown cmd type from applyCh")
 					}
@@ -438,6 +519,7 @@ func (kv *ShardKV) generateSnapshot(index int) {
 	e.Encode(kv.duplicate)
 	e.Encode(kv.configs)
 	e.Encode(kv.workList)
+	e.Encode(kv.gcHistory)
 
 	data := w.Bytes()
 	kv.persist.SaveSnapshot(data)
@@ -461,9 +543,15 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	d.Decode(&kv.duplicate)
 	d.Decode(&kv.configs)
 	d.Decode(&kv.workList)
+	d.Decode(&kv.gcHistory)
 
 	DPrintf("[%d-%d]: server %d read snapshot (configs: %v, worklist: %v).\n",
 		kv.gid, kv.me, kv.me, kv.configs, kv.workList)
+
+	// if snapshot occurs in middle of migration
+	if kv.configs[0].Num != 0 {
+		go kv.restartMigration()
+	}
 }
 
 // should be called when holding the lock
@@ -581,6 +669,43 @@ func (kv *ShardKV) requestShards(old *shardmaster.Config, num int) {
 	}
 }
 
+// notify cleanup garbage shards
+func (kv *ShardKV) requestCleanUp(shard, gid int, config *shardmaster.Config) {
+	args := &CleanUpArgs{
+		Num:   kv.configs[0].Num, // config version
+		Shard: shard,
+		Gid:   kv.gid,
+	}
+
+	DPrintf("[%d-%d]: leader %d issue cleanup shard: %d, gid: %d).\n", kv.gid, kv.me, kv.me, shard, gid)
+
+	for {
+		// shutdown?
+		select {
+		case <-kv.shutdownCh:
+			return
+		default:
+		}
+		// still leader?
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			return
+		}
+		if servers, ok := config.Groups[gid]; ok {
+			// try each server for the shard.
+			for si := 0; si < len(servers); si++ {
+				srv := kv.make_end(servers[si])
+
+				var reply CleanUpReply
+				ok := srv.Call("ShardKV.CleanUp", args, &reply)
+				if ok && reply.WrongLeader == false && reply.Err == OK {
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // should be called when holding the lock
 func (kv *ShardKV) generateWorkList(old, new *shardmaster.Config) {
 	// 0 is initial state, no need to send any shards
@@ -617,24 +742,32 @@ func (kv *ShardKV) restartMigration() {
 	kv.mu.Unlock()
 
 	// clear, no unfinished migration
-	if !ok {
+	if cur == 0 || !ok {
 		return
 	}
+
 	// unfortunately, in middle of updating config when crashed
 	for {
-		kv.mu.Lock()
-		now := kv.configs[0].Num
-		kv.mu.Unlock()
-
-		if cur != now {
+		select {
+		case <-kv.shutdownCh:
 			return
-		}
+		default:
+			kv.mu.Lock()
+			now := kv.configs[0].Num
+			kv.mu.Unlock()
 
-		if _, isLeader := kv.rf.GetState(); isLeader {
-			go kv.requestShards(&work.Old, now)
-		}
+			if cur != now {
+				DPrintf("done....\n")
+				return
+			}
 
-		time.Sleep(100 * time.Millisecond)
+			if _, isLeader := kv.rf.GetState(); isLeader {
+				go kv.requestShards(&work.Last, now)
+			}
+
+			time.Sleep(100 * time.Millisecond)
+			DPrintf("[%d-%d]: restartMigration: config: %d, work: %v\n", kv.gid, kv.me, now, work.RecFrom)
+		}
 	}
 }
 
@@ -734,6 +867,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	gob.Register(Op{})
 	gob.Register(Cfg{})
 	gob.Register(Mig{})
+	gob.Register(CleanUp{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -753,6 +887,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.configs = []shardmaster.Config{{}}
 	kv.workList = make(map[int]MigrateWork)
+	kv.gcHistory = make(map[int]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -761,9 +896,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.readSnapshot(kv.persist.ReadSnapshot())
 
 	// long-running work
-	go kv.applyDaemon()      // get log entry from raft layer
-	go kv.getNextConfig()    // query shard master for configuration
-	go kv.restartMigration() // if crashed and in middle of migration
+	go kv.applyDaemon()   // get log entry from raft layer
+	go kv.getNextConfig() // query shard master for configuration
 
 	DPrintf("StartServer: %d-%d\n", kv.gid, kv.me)
 	return kv
