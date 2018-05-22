@@ -71,9 +71,8 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				// only successful call will call wg.Done()
 				wg.Done()
 
-				// put worker back to register channel, in another goroutines
-				// to avoid deadlock
-				go func() { registerChan <- worker }()
+				// put idle worker back to register channel
+				registerChan <- worker;
 			} else {
 				log.Printf("Schedule: assign %s task %v to %s failed", phase,
 					task.TaskNumber, worker)
