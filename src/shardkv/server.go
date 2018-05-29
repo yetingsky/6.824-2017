@@ -746,7 +746,7 @@ func (kv *ShardKV) restartMigration() {
 		return
 	}
 
-	// unfortunately, in middle of updating config when crashed
+	// unfortunately, in middle of config migration when generates snapshot and then crash
 	for {
 		select {
 		case <-kv.shutdownCh:
@@ -814,21 +814,6 @@ func (kv *ShardKV) isMigrateDone(pos string) bool {
 			kv.gid, kv.me, pos, kv.configs[0].Num, !ok)
 	}()
 	return !ok
-}
-
-// should be called when holding the lock
-func removeRedundant(configs []shardmaster.Config) []shardmaster.Config {
-	if len(configs) == 0 {
-		return configs
-	}
-	num := 0
-	for i := 1; i < len(configs); i++ {
-		if configs[i].Num != configs[num].Num {
-			num++
-			configs[num] = configs[i]
-		}
-	}
-	return configs[:num+1]
 }
 
 //
